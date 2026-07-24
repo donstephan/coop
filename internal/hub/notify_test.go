@@ -94,14 +94,14 @@ func TestNotifyNilTrackerIsNoOp(t *testing.T) {
 }
 
 func TestNotifyArgsSessionAsTitleTaskAsBody(t *testing.T) {
-	want := []string{"-a", "coop", "myrepo needs input", "Simplify tmux session…"}
+	want := []string{"-a", "coop", "-e", "-t", "5000", "myrepo needs input", "Simplify tmux session…"}
 	if got := notifyArgs("myrepo", "Simplify tmux session…"); !slices.Equal(got, want) {
 		t.Fatalf("notifyArgs = %v, want %v", got, want)
 	}
 }
 
 func TestNotifyArgsEmptyTaskOmitsBody(t *testing.T) {
-	want := []string{"-a", "coop", "myrepo needs input"}
+	want := []string{"-a", "coop", "-e", "-t", "5000", "myrepo needs input"}
 	if got := notifyArgs("myrepo", ""); !slices.Equal(got, want) {
 		t.Fatalf("notifyArgs = %v, want %v", got, want)
 	}

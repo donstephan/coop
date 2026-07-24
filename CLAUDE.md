@@ -24,7 +24,19 @@ Three packages under a thin `cmd/coop/main.go`:
 
 ### Core design: tmux is the database
 
-There is no daemon, no hooks, no state file. The model is a `[]hub.Pane` rebuilt from scratch by a 1-second `tmux list-panes` poll; `Status` is derived fresh every poll (`DeriveStatuses`), never stored. Status comes from the pane title Claude Code sets (braille spinner = working, 🔔/bell = needs input), with a screen-capture fallback (`NeedsInputScreen`) that detects an on-screen dialog by its `❯ 1.` option row.
+There is no daemon, no hooks, no state file. The model is a `[]hub.Pane` rebuilt from scratch by a 1-second `tmux list-panes` poll; `Status` is derived fresh every poll (`DeriveStatuses`), never stored. Status comes from three sources, in order:
+
+1. **Claude Code's own published state** (`internal/hub/claudestate.go`) — it writes `~/.claude/sessions/<pid>.json` per process, carrying `status` (`busy`/`waiting`/`idle`), `sessionId`, a derived `name`, and `statusUpdatedAt`. `#{pane_pid}` joins a pane to its file. This is undocumented internal state (shape observed on 2.1.219), so every read is best-effort and an unrecognized `status` string falls through to the heuristics below rather than mislabelling a pane. Files outlive a SIGKILLed process, so the file's `procStart` is checked against `/proc/<pid>/stat` field 22 before it is trusted.
+2. **The pane title** Claude Code sets (braille spinner = working, 🔔/bell = needs input).
+3. **A screen-capture fallback** (`NeedsInputScreen`) detecting an on-screen dialog by its `❯ 1.` option row — skipped for panes that published their own status, which is most of the poll's tmux traffic.
+
+The time column ages from `Pane.Since()` — Claude's `statusUpdatedAt` where there is one, else the session start — so a row reads "waiting 6m", not "session started 3h ago".
+
+### The stat column (`internal/hub/transcript.go`)
+
+`s` cycles an optional right-hand column: off → context → model. Off is the default, and the poll skips transcript I/O entirely while it is (`nil` stats func), so the nav keeps its pinned `navWidth`. Turning it on widens the pane to `navWidth+statWidth` via the same `resizeSelf` path a terminal resize uses.
+
+`Transcripts` reads `~/.claude/projects/<slug>/<sessionId>.jsonl`, resolving the file from the `sessionId` in the pane's published state (with a by-id glob fallback, since a session outlives a directory rename). Only the last `tailBytes` are read and only the last main-thread assistant turn is parsed — subagent turns (`isSidechain`) carry unrelated context. Results cache on mtime+size so a 1-second poll doesn't re-parse. Context is that turn's `input + cache_read + cache_creation`, so it lags by a turn; there is no published window limit (sessions run both 200k and 1M), so it renders as an absolute count, never a percentage. Anything missing renders blank, never `0k`.
 
 The one status needing memory across polls — `done` (finished working, not yet seen) — is persisted as tmux **user options on the tracked panes themselves** (`@coop_working`, `@coop_done_since`, managed by `DoneTracker`), so multiple hub instances on the socket share one view and state dies with its pane. Other user options: `@coop` marks a hub instance's own session (hidden from the list, used to reuse detached hubs), `@coop_live` marks the live preview pane (so a restarted TUI adopts it instead of stacking splits).
 
@@ -46,3 +58,5 @@ Exact-match `=` prefixes and trailing `:` on session targets are load-bearing (`
 ## Testing
 
 Unit tests never touch a real tmux: `hub` tests parse canned output or use `fakeTmux`; `tui` tests construct a `Model` and feed `Update` messages directly, asserting on returned commands' messages. `scripts/e2e-smoke.sh` covers the real-tmux integration (discovery, status, live preview, retarget, create, kill, quit) — run it when changing launch, live-pane, or tmux plumbing.
+
+**Never put paths from the developer's own machine into tests or fixtures** — no `/home/<username>/…`, no real home directory, no absolute path to this checkout. Fixture paths are always generic (`/home/user/coop`, `/home/user/Documents/coop/git/coop`, `/home/user/sprocket-v2`); anything the test actually writes to goes under `t.TempDir()`. The same goes for repo and session names — invent them (`sprocket-v2`, `alpha`, `beta`), never borrow a real project's. Tests must pass for any user on any machine, and a real path leaks the developer's environment into the repo.

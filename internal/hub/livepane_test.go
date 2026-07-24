@@ -6,12 +6,12 @@ import (
 )
 
 func TestAttachCmdShape(t *testing.T) {
-	cmd := AttachCmd("cc", "dataset-v2")
+	cmd := AttachCmd("cc", "sprocket-v2")
 	for _, want := range []string{
-		"TMUX=",                   // clear TMUX or tmux refuses to nest
-		"tmux -L 'cc'",            // same socket
-		"attach -t '=dataset-v2'", // exact-match target, no prefix surprises
-		"-f ignore-size",          // never fight the Ghostty client for size
+		"TMUX=",                    // clear TMUX or tmux refuses to nest
+		"tmux -L 'cc'",             // same socket
+		"attach -t '=sprocket-v2'", // exact-match target, no prefix surprises
+		"-f ignore-size",           // never fight the Ghostty client for size
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("AttachCmd missing %q: %s", want, cmd)

@@ -43,12 +43,21 @@ type Tmux interface {
 type Pane struct {
 	Session string
 	ID      string // tmux pane id, e.g. "%0"
+	PID     int    // pane_pid — keys Claude Code's session state file
 	Title   string // pane_title — Claude Code encodes its state here
 	Bell    bool   // window_bell_flag — set when the pane rang the bell
 	Cmd     string // pane_current_command
 	Path    string // session_path — the session's start directory
 	Created time.Time
 	Status  Status // filled by DeriveStatuses, not by parsing
+
+	// Claude Code's own published state for this pane's process, when it
+	// publishes one (see ClaudeSessions). Nil for everything else.
+	Claude *ClaudeState
+
+	// Stats from the session's transcript, filled only when the TUI is
+	// showing a column that needs them (see Transcripts). Nil otherwise.
+	Stats *TranscriptStats
 
 	// Shared cross-hub state, read from user options each poll so every
 	// hub instance on the socket sees the same thing.
@@ -112,7 +121,7 @@ const (
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}"
 
 // unixTime parses a "#{...}" unix-seconds field; anything unparseable
 // (including unset = "") reads as the zero time.
@@ -128,14 +137,15 @@ func parsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Split(line, "\x1f")
-		if len(f) != 11 {
+		if len(f) != 12 {
 			continue
 		}
+		pid, _ := strconv.Atoi(f[2]) // unreadable pid = 0 = no state lookup
 		panes = append(panes, Pane{
-			Session: f[0], ID: f[1], Title: f[2],
-			Bell: f[3] == "1", Cmd: f[4], Created: unixTime(f[5]), Path: f[6],
-			Hub: f[7] == "1", WorkingMark: f[8] == "1", DoneSince: unixTime(f[9]),
-			NotifiedMark: f[10] == "1",
+			Session: f[0], ID: f[1], PID: pid, Title: f[3],
+			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
+			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
+			NotifiedMark: f[11] == "1",
 		})
 	}
 	return panes

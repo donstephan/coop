@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -249,6 +251,40 @@ func (m Model) pollMsgNow(t *testing.T) tea.Msg {
 	return m.poll()()
 }
 
+// Claude Code publishes its status per pid; the poll joins on pane_pid
+// and that beats the pane title (idle-looking here, actually busy).
+func TestPollUsesClaudeState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "4242.json"),
+		[]byte(`{"sessionId":"abc","name":"coop-fd","status":"busy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeTmux{panes: []hub.Pane{
+		{Session: "coop", ID: "%1", PID: 4242, Title: "✻ coop", Cmd: "claude"},
+		{Session: "other", ID: "%2", PID: 99, Title: "⠂ working", Cmd: "claude"},
+	}}
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, 0)
+	m.claude = &hub.ClaudeSessions{Dir: dir}
+	m = drive(t, m, m.poll())
+	if m.panes[0].Status != hub.StatusWorking {
+		t.Errorf("pane with published state: Status = %v, want working", m.panes[0].Status)
+	}
+	if m.panes[0].Claude == nil || m.panes[0].Claude.Name != "coop-fd" {
+		t.Errorf("pane should carry its published state, got %+v", m.panes[0].Claude)
+	}
+	// No file for pid 99: that pane still reads its title.
+	if m.panes[1].Status != hub.StatusWorking || m.panes[1].Claude != nil {
+		t.Errorf("pane without published state: %v %+v", m.panes[1].Status, m.panes[1].Claude)
+	}
+}
+
+func TestNewReadsDefaultClaudeSessions(t *testing.T) {
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, 0)
+	if m.claude == nil {
+		t.Fatal("New should wire up the default ~/.claude/sessions reader")
+	}
+}
+
 func TestPollFiltersHubAndSorts(t *testing.T) {
 	m := pollOnce(t, &fakeTmux{panes: testPanes()})
 	if len(m.panes) != 2 {
@@ -299,7 +335,7 @@ func TestViewShowsSessionsAndStatus(t *testing.T) {
 	m := pollOnce(t, &fakeTmux{panes: testPanes()})
 	view := m.View()
 	for _, want := range []string{"alpha-repo", "beta-repo",
-		"○ Claude Code", "● permission needed"} {
+		"○ Claude Code", "◆ permission needed"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q:\n%s", want, view)
 		}
@@ -320,10 +356,217 @@ func TestViewGroupsByRepo(t *testing.T) {
 	}
 }
 
+// The time column ages from the current status, not from session start:
+// a session that has run for hours but only just went idle reads "4m".
+func TestViewShowsStatusAgeNotSessionAge(t *testing.T) {
+	old := time.Now().Add(-3 * time.Hour)
+	f := &fakeTmux{panes: []hub.Pane{{
+		Session: "alpha", ID: "%1", Title: "✳ Claude Code", Cmd: "claude",
+		Path: "/repos/alpha-repo", Created: old,
+	}}}
+	m := pollOnce(t, f)
+	if !strings.Contains(m.View(), "3h00m") {
+		t.Fatalf("without published state the row should age from session start:\n%s", m.View())
+	}
+
+	m.panes[0].Claude = &hub.ClaudeState{
+		Status: "idle", StatusSince: time.Now().Add(-4 * time.Minute)}
+	view := m.View()
+	if !strings.Contains(view, "4m") || strings.Contains(view, "3h00m") {
+		t.Errorf("row should age from the published status (4m), not the session (3h00m):\n%s", view)
+	}
+}
+
+func TestLiveTitleUsesStatusAge(t *testing.T) {
+	panes := []hub.Pane{{
+		ID: "%1", Title: "✻ alpha", Created: time.Now().Add(-3 * time.Hour),
+		Claude: &hub.ClaudeState{Status: "busy", StatusSince: time.Now().Add(-4 * time.Minute)},
+	}}
+	hub.DeriveStatuses(panes, nil)
+	if got := liveTitleFor(panes, "%1"); got != "working · 4m · alpha" {
+		t.Errorf("liveTitleFor = %q, want %q", got, "working · 4m · alpha")
+	}
+}
+
+// Each status gets its own shape, so a glance doesn't have to tell blue
+// from yellow — colour reinforces the marker instead of carrying it.
+func TestStatusGlyph(t *testing.T) {
+	want := map[hub.Status]string{
+		hub.StatusNeedsInput: "◆",
+		hub.StatusWorking:    "●",
+		hub.StatusDone:       "✓",
+		hub.StatusIdle:       "○",
+	}
+	seen := map[string]hub.Status{}
+	for st, w := range want {
+		got := statusGlyph(st)
+		if got != w {
+			t.Errorf("statusGlyph(%v) = %q, want %q", st, got, w)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Errorf("statusGlyph(%v) and (%v) both render %q", st, prev, got)
+		}
+		seen[got] = st
+		// The row pads by display width; a two-cell glyph would shear
+		// every column to its right.
+		if w := lipgloss.Width(got); w != 1 {
+			t.Errorf("statusGlyph(%v) = %q is %d cells wide, want 1", st, got, w)
+		}
+	}
+}
+
+func TestModelBadge(t *testing.T) {
+	cases := map[string]string{
+		"claude-opus-5":             "o5",
+		"claude-fable-5":            "f5",
+		"claude-opus-4-8":           "o4.8",
+		"claude-sonnet-5":           "s5",
+		"claude-haiku-4-5-20251001": "h4.5",
+		"something-new-7":           "something",
+		"":                          "",
+	}
+	for in, want := range cases {
+		if got := modelBadge(in); got != want {
+			t.Errorf("modelBadge(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The five levels `claude --effort` accepts, verified against 2.1.219.
+func TestEffortBadge(t *testing.T) {
+	cases := map[string]string{
+		"low": "lo", "medium": "md", "high": "hi", "xhigh": "xh", "max": "mx",
+		"": "", "weird": "",
+	}
+	for in, want := range cases {
+		if got := effortBadge(in); got != want {
+			t.Errorf("effortBadge(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormatTokens(t *testing.T) {
+	cases := map[int]string{
+		0: "", 940: "940", 30256: "30k", 136517: "137k", 352885: "353k",
+		999_499: "999k", 1_251_204: "1.3M",
+	}
+	for in, want := range cases {
+		if got := formatTokens(in); got != want {
+			t.Errorf("formatTokens(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// s cycles the extra column off → context → model → off.
+func TestStatColumnCycles(t *testing.T) {
+	m := pollOnce(t, &fakeTmux{panes: testPanes()})
+	if m.statCol != statColOff {
+		t.Fatalf("stat column should start off, got %v", m.statCol)
+	}
+	for _, want := range []statColumn{statColContext, statColModel, statColOff} {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+		m = next.(Model)
+		if m.statCol != want {
+			t.Fatalf("after s: statCol = %v, want %v", m.statCol, want)
+		}
+	}
+}
+
+func TestViewShowsStatColumn(t *testing.T) {
+	f := &fakeTmux{panes: []hub.Pane{{
+		Session: "alpha", ID: "%1", Title: "✳ Claude Code", Cmd: "claude",
+		Path: "/repos/alpha-repo",
+	}}}
+	m := pollOnce(t, f)
+	m.panes[0].Stats = &hub.TranscriptStats{
+		Context: 136517, Model: "claude-opus-5", Effort: "high"}
+
+	if v := m.View(); strings.Contains(v, "137k") || strings.Contains(v, "o5·hi") {
+		t.Errorf("stat column is off; nothing should render:\n%s", v)
+	}
+	m.statCol = statColContext
+	if v := m.View(); !strings.Contains(v, "137k") {
+		t.Errorf("context column missing:\n%s", v)
+	}
+	m.statCol = statColModel
+	if v := m.View(); !strings.Contains(v, "o5·hi") {
+		t.Errorf("model column missing:\n%s", v)
+	}
+}
+
+// Token counts are right-aligned so the column reads as numbers; model
+// badges are left-aligned so they read as labels.
+func TestStatTextAlignment(t *testing.T) {
+	p := hub.Pane{Stats: &hub.TranscriptStats{
+		Context: 30256, Model: "claude-opus-5", Effort: "high"}}
+	if got := statText(p, statColContext); got != " 30k" {
+		t.Errorf("context cell = %q, want %q (right-aligned)", got, " 30k")
+	}
+	if got := statText(p, statColModel); got != "o5·hi" {
+		t.Errorf("model cell = %q, want %q (unpadded)", got, "o5·hi")
+	}
+	if got := statText(hub.Pane{}, statColContext); got != "" {
+		t.Errorf("no stats should be blank, not padded, got %q", got)
+	}
+}
+
+// A session with no transcript yet leaves the column blank rather than
+// rendering a zero that reads like a measurement.
+func TestViewStatColumnBlankWithoutStats(t *testing.T) {
+	m := pollOnce(t, &fakeTmux{panes: testPanes()})
+	m.statCol = statColContext
+	if v := m.View(); strings.Contains(v, "0k") {
+		t.Errorf("missing stats should render blank, not 0k:\n%s", v)
+	}
+}
+
+// Turning the column on widens the nav pane; tmux has to be told.
+func TestStatColumnResizesNav(t *testing.T) {
+	f := &fakeTmux{panes: livePanes(), splitID: "%50"}
+	m := bootLive(t, f)
+	m.selfPane, m.width = "%9", navWidth
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("turning the column on should resize the nav pane")
+	}
+	cmd()
+	want := fmt.Sprintf("%%9 %d", navWidth+statWidth)
+	if len(f.paneResizes) != 1 || f.paneResizes[0] != want {
+		t.Fatalf("paneResizes = %v, want [%s]", f.paneResizes, want)
+	}
+}
+
+// Reading transcripts is file I/O on every poll tick — don't do it for a
+// column nobody is looking at.
+func TestPollSkipsTranscriptsWhenColumnOff(t *testing.T) {
+	// A transcript is found via the session id in the pane's published
+	// state, so the pane needs one. PID 0 means AttachClaudeState skips
+	// the pane and leaves the state the fake supplied.
+	panes := testPanes()
+	panes[1].Claude = &hub.ClaudeState{SessionID: "abc", Status: "idle"}
+	f := &fakeTmux{panes: panes}
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, 0)
+	asked := 0
+	m.transcripts = func(sessionID, cwd string) (hub.TranscriptStats, bool) {
+		asked++
+		return hub.TranscriptStats{}, false
+	}
+	m = drive(t, m, m.poll())
+	if asked != 0 {
+		t.Fatalf("column off: %d transcript reads, want 0", asked)
+	}
+	m.statCol = statColContext
+	m = drive(t, m, m.poll())
+	if asked == 0 {
+		t.Fatal("column on: transcripts should be read")
+	}
+}
+
 func TestCleanTitle(t *testing.T) {
 	cases := map[string]string{
 		"✳ Claude Code": "Claude Code",
-		"✻ dataset-v2":  "dataset-v2",
+		"✻ sprocket-v2": "sprocket-v2",
 		"⠂ compiling":   "compiling",
 		"🔔 pick one":    "pick one",
 		"plain":         "plain",
@@ -911,7 +1154,7 @@ func TestScreenDialogTurnsIdleIntoNeedsInput(t *testing.T) {
 	if m.panes[i].Status != hub.StatusNeedsInput {
 		t.Fatalf("alpha with on-screen dialog should be needs-input, got %v", m.panes[i].Status)
 	}
-	if !strings.Contains(m.View(), "● Claude Code") {
+	if !strings.Contains(m.View(), "◆ Claude Code") {
 		t.Error("view should render alpha's derived needs-input glyph")
 	}
 }
@@ -1460,18 +1703,19 @@ func TestLivePaneRecreatedWhenKilled(t *testing.T) {
 	}
 }
 
-// Retargeting the preview also retitles its tmux title bar with the
-// new session's name, status, and age.
+// Retargeting the preview also retitles its tmux title bar with the new
+// session's status, age, and task text. No session name: the nav list
+// groups by repo and doesn't show names either.
 func TestRetargetSetsPreviewTitle(t *testing.T) {
 	f := &fakeTmux{panes: livePanes(), splitID: "%50"}
 	m := bootLive(t, f) // alpha (top of the list) selected
-	if len(f.titles) != 1 || f.titles[0] != [2]string{"%50", "alpha · idle · - · Claude Code"} {
+	if len(f.titles) != 1 || f.titles[0] != [2]string{"%50", "idle · - · Claude Code"} {
 		t.Fatalf("titles = %v, want alpha's title set on %%50", f.titles)
 	}
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyDown}) // → beta
 	m = next.(Model)
 	m, _ = driveCmd(t, m, cmd)
-	if len(f.titles) != 2 || f.titles[1] != [2]string{"%50", "beta · NEEDS INPUT · - · permission needed"} {
+	if len(f.titles) != 2 || f.titles[1] != [2]string{"%50", "NEEDS INPUT · - · permission needed"} {
 		t.Fatalf("titles = %v, want beta's title appended", f.titles)
 	}
 }
@@ -1492,7 +1736,7 @@ func TestPollRefreshesPreviewTitle(t *testing.T) {
 		}
 	}
 	m = drive(t, m, m.poll())
-	if len(f.titles) != 2 || f.titles[1] != [2]string{"%50", "alpha · working · - · compiling"} {
+	if len(f.titles) != 2 || f.titles[1] != [2]string{"%50", "working · - · compiling"} {
 		t.Fatalf("titles = %v, want refreshed alpha title", f.titles)
 	}
 	m, _ = driveCmd(t, m, m.poll()) // and it dedupes again

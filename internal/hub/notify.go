@@ -43,8 +43,15 @@ func (t *NotifyTracker) Apply(panes []Pane) []Pane {
 // notifyArgs builds the notify-send argv: the session as the summary
 // line, the task (what Claude was doing, per its pane title) as the
 // body — omitted when empty so title-less panes get a one-liner.
+//
+// A notification is a nudge, not the record — coop's own list is the
+// record — so it is sent transient (-e): daemons that keep a history
+// (GNOME Shell's message list, dunst) drop it after the banner instead
+// of stacking one entry per session per episode. -t is belt-and-braces
+// for daemons that honour an expiry; GNOME Shell ignores it outright,
+// which is why -e is the one that actually fixes the pile-up.
 func notifyArgs(session, task string) []string {
-	args := []string{"-a", "coop", session + " needs input"}
+	args := []string{"-a", "coop", "-e", "-t", "5000", session + " needs input"}
 	if task != "" {
 		args = append(args, task)
 	}

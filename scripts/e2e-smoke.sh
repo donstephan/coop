@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # E2E smoke test on a throwaway tmux socket: a stub session prints a fake
 # prompt and rings the bell; the coop TUI (itself driven via tmux) must
-# list it as NEEDS INPUT, live-preview it in a nested-client pane, and
+# derive NEEDS INPUT for it, live-preview it in a nested-client pane, and
 # retarget the pane on selection change.
 set -euo pipefail
 
@@ -46,6 +46,19 @@ wait_for() { # wait_for <pattern> <pane>
   exit 1
 }
 
+# Status words appear on the live pane's title bar, never in the nav
+# list — a row shows a coloured ●/○ glyph. Both come from the same
+# DeriveStatuses pass, so polling the title tests the same derivation.
+wait_for_title() { # wait_for_title <pattern> <pane>
+  for _ in $(seq 40); do
+    tmux -L "$SOCKET" display -p -t "$2" '#{pane_title}' | grep -q "$1" && return 0
+    sleep 0.25
+  done
+  echo "FAIL: title of $2 never matched '$1'" >&2
+  echo "got: $(tmux -L "$SOCKET" display -p -t "$2" '#{pane_title}')" >&2
+  exit 1
+}
+
 # The TUI must create a marked live pane in the hub session.
 live=""
 for _ in $(seq 40); do
@@ -65,7 +78,7 @@ nav="$(tmux -L "$SOCKET" list-panes -s -t hub -F '#{pane_id} #{@coop_live}' \
 [ -n "$nav" ] || { echo "FAIL: nav pane not found" >&2; exit 1; }
 
 wait_for "stub" "$nav"
-wait_for "NEEDS INPUT" "$nav"
+wait_for_title "NEEDS INPUT" "$live"
 wait_for "1. Yes" "$live"      # nested client renders the stub's screen
 echo "ok: discovery, status, live preview"
 

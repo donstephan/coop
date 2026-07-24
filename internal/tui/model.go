@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -55,6 +56,11 @@ type Model struct {
 	socket     string
 	done       *hub.DoneTracker
 	notify     *hub.NotifyTracker
+	claude     *hub.ClaudeSessions // Claude Code's own per-process state
+	// transcripts reads session transcripts for the stat column; a field
+	// rather than a concrete type so tests can substitute one.
+	transcripts func(sessionID, cwd string) (hub.TranscriptStats, bool)
+	statCol     statColumn
 
 	panes      []hub.Pane
 	hubNames   []string // hub sessions seen by the last poll (incl. our own)
@@ -79,8 +85,8 @@ type Model struct {
 	repos          []string // picker contents, loaded at open
 	repoFilter     string   // typed filter; narrows repos by base name
 	repoIdx        int      // index into filteredRepos(), not repos
-	pendingSession string // session to auto-select when it appears
-	focusPending   bool   // focus the preview once it shows the new session
+	pendingSession string   // session to auto-select when it appears
+	focusPending   bool     // focus the preview once it shows the new session
 	claudeCmd      string
 	loadRepos      func() ([]string, error)
 
@@ -93,8 +99,9 @@ func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
 	return Model{tmux: tm, allowed: allowed, hubSession: hubSession,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
 		loadRepos: loadRepos, done: hub.NewDoneTracker(doneTTL, tm),
-		notify:  hub.NewNotifyTracker(tm),
-		focused: true, width: 80, height: 24}
+		notify: hub.NewNotifyTracker(tm), claude: hub.DefaultClaudeSessions(),
+		transcripts: hub.DefaultTranscripts().Stats,
+		focused:     true, width: 80, height: 24}
 }
 
 // LivePane is the live preview pane's id ("" if none) — main kills it on
@@ -116,6 +123,10 @@ func tick() tea.Cmd {
 func (m Model) poll() tea.Cmd {
 	tm, hubSession, live := m.tmux, m.hubSession, m.livePane
 	done, notify, liveTarget := m.done, m.notify, m.liveTarget
+	claude, transcripts := m.claude, m.transcripts
+	if m.statCol == statColOff {
+		transcripts = nil // nobody is looking; don't touch the filesystem
+	}
 	selected, lastTitle := m.selectedID, m.liveTitle
 	return func() tea.Msg {
 		all, err := tm.ListSessions()
@@ -133,6 +144,8 @@ func (m Model) poll() tea.Cmd {
 				hubs = append(hubs, p.Session)
 			}
 		}
+		hub.AttachClaudeState(panes, claude.Lookup)
+		hub.AttachTranscriptStats(panes, transcripts)
 		hub.DeriveStatuses(panes, tm.CapturePane)
 		for _, p := range notify.Apply(panes) {
 			hub.NotifySend(p.Session, cleanTitle(p.Title))
@@ -158,7 +171,7 @@ func (m Model) poll() tea.Cmd {
 func liveTitleFor(panes []hub.Pane, selected string) string {
 	for _, p := range panes {
 		if p.ID == selected {
-			s := p.Status.String() + " · " + age(p.Created)
+			s := p.Status.String() + " · " + age(p.Since())
 			if task := cleanTitle(p.Title); task != "" {
 				s += " · " + task
 			}
@@ -366,11 +379,11 @@ func (m Model) resizeLive() tea.Cmd {
 // 60% default and proportional redistribution on terminal resize both
 // leave the nav wider than its fixed-width rows need.
 func (m Model) resizeSelf() tea.Cmd {
-	if m.selfPane == "" || m.livePane == "" || m.width == navWidth {
+	if m.selfPane == "" || m.livePane == "" || m.width == m.navCols() {
 		return nil
 	}
-	tm, pane := m.tmux, m.selfPane
-	return func() tea.Msg { return resizedMsg{err: tm.ResizePane(pane, navWidth)} }
+	tm, pane, cols := m.tmux, m.selfPane, m.navCols()
+	return func() tea.Msg { return resizedMsg{err: tm.ResizePane(pane, cols)} }
 }
 
 // nextNeedsInput is the next needs-input pane in display order, scanning
@@ -768,6 +781,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if i := m.indexOf(m.selectedID); i >= 0 {
 			m.confirmKill = m.panes[i].Session
 		}
+	case "s":
+		// Widening the nav is the only tmux work; the stats themselves
+		// land on the next poll tick.
+		m.statCol = m.statCol.next()
+		return m, m.resizeSelf()
 	case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		if m.selectedID != "" {
 			return m, m.answerCmd(m.selectedID, msg.String())
@@ -940,11 +958,18 @@ func statusStyle(s hub.Status) lipgloss.Style {
 	}
 }
 
-// statusGlyph is the row's one-cell status marker: ● for the active
-// statuses, ○ for idle. statusStyle's colour carries the distinction.
+// statusGlyph is the row's one-cell status marker, a distinct shape per
+// status: ◆ needs input, ● working, ✓ done, ○ idle. statusStyle's colour
+// reinforces the shape rather than carrying the distinction alone — a
+// scan shouldn't depend on telling two hues apart. All four must stay
+// one cell wide or the columns to their right shear (see TestStatusGlyph).
 func statusGlyph(s hub.Status) string {
 	switch s {
-	case hub.StatusNeedsInput, hub.StatusDone, hub.StatusWorking:
+	case hub.StatusNeedsInput:
+		return "◆"
+	case hub.StatusDone:
+		return "✓"
+	case hub.StatusWorking:
 		return "●"
 	default:
 		return "○"
@@ -958,6 +983,123 @@ const titleWidth = 32
 // gap (2) + title column (titleWidth+1) + age ("12h34m"), plus 4 cells
 // for the frame's borders and padding — the longest row fits exactly.
 const navWidth = 47
+
+// statWidth is what the optional stat column adds: the widest badge
+// ("o4.8·xh"), the numeric form being narrower.
+const statWidth = 7
+
+// statColumn selects the optional right-hand column. Off by default so
+// the nav keeps its pinned width and the poll skips reading transcripts.
+type statColumn int
+
+const (
+	statColOff statColumn = iota
+	statColContext
+	statColModel
+)
+
+func (s statColumn) next() statColumn {
+	if s == statColModel {
+		return statColOff
+	}
+	return s + 1
+}
+
+// navCols is the nav pane's current width — navWidth, plus the stat
+// column when one is showing.
+func (m Model) navCols() int {
+	if m.statCol == statColOff {
+		return navWidth
+	}
+	return navWidth + statWidth
+}
+
+// statText is a pane's stat cell, blank when the transcript hasn't been
+// read (or has nothing to say yet) — a blank column reads as "unknown",
+// where "0k" would read as a measurement.
+func statText(p hub.Pane, col statColumn) string {
+	if p.Stats == nil {
+		return ""
+	}
+	switch col {
+	case statColContext:
+		// Right-aligned: a column of numbers should line up on its
+		// units. "1.3M" is the widest form formatTokens produces.
+		if s := formatTokens(p.Stats.Context); s != "" {
+			return fmt.Sprintf("%4s", s)
+		}
+		return ""
+	case statColModel:
+		badge := modelBadge(p.Stats.Model)
+		if e := effortBadge(p.Stats.Effort); badge != "" && e != "" {
+			badge += "·" + e
+		}
+		return badge
+	}
+	return ""
+}
+
+// modelBadge shortens a model id for the column: "claude-opus-4-8" reads
+// "o4.8". Anything unrecognized falls back to its first id segment, so a
+// model released after this code still shows something.
+func modelBadge(model string) string {
+	rest, ok := strings.CutPrefix(model, "claude-")
+	if !ok {
+		if model == "" {
+			return ""
+		}
+		return firstSegment(model)
+	}
+	family, version, ok := strings.Cut(rest, "-")
+	if !ok || family == "" {
+		return firstSegment(rest)
+	}
+	// Dated ids ("haiku-4-5-20251001") carry a trailing date; the two
+	// leading numbers are the version.
+	parts := strings.Split(version, "-")
+	num := parts[0]
+	if len(parts) > 1 && len(parts[1]) < 4 {
+		num += "." + parts[1]
+	}
+	return family[:1] + num
+}
+
+func firstSegment(s string) string {
+	seg, _, _ := strings.Cut(s, "-")
+	return seg
+}
+
+// effortBadge shortens the effort levels `claude --effort` accepts.
+// Unknown values render blank rather than guessing.
+func effortBadge(effort string) string {
+	switch effort {
+	case "low":
+		return "lo"
+	case "medium":
+		return "md"
+	case "high":
+		return "hi"
+	case "xhigh":
+		return "xh"
+	case "max":
+		return "mx"
+	}
+	return ""
+}
+
+// formatTokens renders a token count in the narrowest honest form.
+// Zero is blank: no reading, rather than a reading of nothing.
+func formatTokens(n int) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 1_000_000:
+		return strconv.Itoa((n+500)/1000) + "k"
+	}
+	return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+}
 
 // truncate caps s at n runes, ending in … when cut.
 func truncate(s string, n int) string {
@@ -1089,7 +1231,10 @@ func (m Model) viewNav() string {
 		st := statusStyle(p.Status)
 		line := pad(st.Render(statusGlyph(p.Status)+" "+
 			truncate(cleanTitle(p.Title), titleWidth)), titleWidth+3) +
-			age(p.Created)
+			age(p.Since())
+		if m.statCol != statColOff {
+			line = pad(line, navWidth-6) + footStyle.Render(statText(p, m.statCol))
+		}
 		if p.ID == m.selectedID {
 			b.WriteString(cursorStyle.Render("▸ "+line) + "\n")
 		} else {
@@ -1163,7 +1308,7 @@ func (m Model) viewFooter() string {
 	if m.showHelp {
 		hints = []string{"↑/↓ select", "enter focus", "tab next input",
 			"shift+←/→ switch pane", "0-9 answer", "bksp erase",
-			"/ command", "n new", "x kill", "q quit", "? close"}
+			"/ command", "n new", "x kill", "s stats", "q quit", "? close"}
 	}
 	return flowHints(hints, m.width-4) // frame() draws "│ " and " │"
 }

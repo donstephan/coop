@@ -12,12 +12,12 @@ func TestStatusFor(t *testing.T) {
 		pane Pane
 		want Status
 	}{
-		{"bell flag wins", Pane{Title: "✻ dataset-v2", Bell: true}, StatusNeedsInput},
+		{"bell flag wins", Pane{Title: "✻ sprocket-v2", Bell: true}, StatusNeedsInput},
 		{"bell emoji in title", Pane{Title: "🔔 needs your input"}, StatusNeedsInput},
 		{"braille spinner = working", Pane{Title: "⠂ Simplify tmux session management"}, StatusWorking},
 		{"other spinner frame", Pane{Title: "⠧ thinking"}, StatusWorking},
 		{"default title = idle", Pane{Title: "✳ Claude Code"}, StatusIdle},
-		{"named idle", Pane{Title: "✻ dataset-v2"}, StatusIdle},
+		{"named idle", Pane{Title: "✻ sprocket-v2"}, StatusIdle},
 		{"empty title = idle", Pane{Title: ""}, StatusIdle},
 		{"bell emoji beats spinner", Pane{Title: "⠂ working 🔔"}, StatusNeedsInput},
 	}
@@ -25,6 +25,32 @@ func TestStatusFor(t *testing.T) {
 		if got := StatusFor(c.pane); got != c.want {
 			t.Errorf("%s: StatusFor(%q, bell=%v) = %v, want %v",
 				c.name, c.pane.Title, c.pane.Bell, got, c.want)
+		}
+	}
+}
+
+// Claude Code publishes its own status per process (see ClaudeSessions),
+// which beats every heuristic StatusFor otherwise applies to the title.
+func TestStatusForPrefersClaudeState(t *testing.T) {
+	cases := []struct {
+		name string
+		pane Pane
+		want Status
+	}{
+		{"busy beats plain title",
+			Pane{Title: "✻ coop", Claude: &ClaudeState{Status: "busy"}}, StatusWorking},
+		{"idle beats spinner title",
+			Pane{Title: "⠂ working", Claude: &ClaudeState{Status: "idle"}}, StatusIdle},
+		{"busy beats a latched bell",
+			Pane{Title: "✻ coop", Bell: true, Claude: &ClaudeState{Status: "busy"}}, StatusWorking},
+		{"waiting without any bell",
+			Pane{Title: "✻ coop", Claude: &ClaudeState{Status: "waiting"}}, StatusNeedsInput},
+		{"unrecognized status falls back to the title",
+			Pane{Title: "⠂ working", Claude: &ClaudeState{Status: "hibernating"}}, StatusWorking},
+	}
+	for _, c := range cases {
+		if got := StatusFor(c.pane); got != c.want {
+			t.Errorf("%s: StatusFor = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
@@ -204,6 +230,30 @@ func TestDeriveStatuses(t *testing.T) {
 		if id == "%2" || id == "%3" {
 			t.Errorf("captured %s, but non-idle panes must not be captured", id)
 		}
+	}
+}
+
+// First-party state is authoritative, so the screen-capture fallback —
+// the expensive part of a poll — is pure waste for those panes.
+func TestDeriveStatusesSkipsCaptureWithClaudeState(t *testing.T) {
+	panes := []Pane{
+		{ID: "%1", Title: "✳ Claude Code", Claude: &ClaudeState{Status: "idle"}},
+		{ID: "%2", Title: "✳ Claude Code"},
+	}
+	var asked []string
+	capture := func(pane string) (string, error) {
+		asked = append(asked, pane)
+		return screenPermissionDialog, nil
+	}
+	DeriveStatuses(panes, capture)
+	if len(asked) != 1 || asked[0] != "%2" {
+		t.Fatalf("only the pane without published state should be captured, got %v", asked)
+	}
+	if panes[0].Status != StatusIdle {
+		t.Errorf("pane %%1 = %v, want idle from its published state", panes[0].Status)
+	}
+	if panes[1].Status != StatusNeedsInput {
+		t.Errorf("pane %%2 = %v, want needs-input from its screen", panes[1].Status)
 	}
 }
 

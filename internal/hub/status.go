@@ -35,7 +35,15 @@ func (s Status) String() string {
 // session with a braille spinner frame ("⠂ Simplify tmux session…"), rings
 // the bell / adds 🔔 when it needs input, and otherwise shows "✳ Claude
 // Code" or "✻ <name>".
+// Claude Code also publishes its own status per process (ClaudeSessions)
+// and that beats every heuristic here — including a bell flag tmux
+// latched during an earlier needs-input episode.
 func StatusFor(p Pane) Status {
+	if p.Claude != nil {
+		if st, ok := p.Claude.status(); ok {
+			return st
+		}
+	}
 	if p.Bell || strings.Contains(p.Title, "🔔") {
 		return StatusNeedsInput
 	}
@@ -89,7 +97,9 @@ func NeedsInputScreen(screen string) bool {
 func DeriveStatuses(panes []Pane, capture func(pane string) (string, error)) {
 	for i := range panes {
 		st := StatusFor(panes[i])
-		if st == StatusIdle && capture != nil {
+		// The capture exists to catch dialogs the title can't show; a
+		// pane publishing its own status has already told us.
+		if st == StatusIdle && capture != nil && !panes[i].claudeStatusKnown() {
 			if screen, err := capture(panes[i].ID); err == nil && NeedsInputScreen(screen) {
 				st = StatusNeedsInput
 			}
