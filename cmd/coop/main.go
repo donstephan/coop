@@ -2,10 +2,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -178,6 +181,11 @@ func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL 
 }
 
 func main() {
+	// Helper subcommands (the arbiter's tools) bypass the TUI entirely.
+	if isArbiterCmd(os.Args[1:]) {
+		os.Exit(runArbiterCLI(os.Args[1:], os.Stdout, os.Stderr))
+	}
+
 	socket := flag.String("socket", envOr("COOP_SOCKET", "coop"),
 		"tmux socket name (tmux -L)")
 	cmds := flag.String("allowed-cmds", envOr("COOP_ALLOWED_CMDS", "claude,node"),
@@ -225,18 +233,34 @@ func main() {
 	if err := hub.ApplyHubStyle(tm, hubSession, os.Getenv("TMUX_PANE")); err != nil {
 		fmt.Fprintln(os.Stderr, "coop: style:", err)
 	}
+	// A missing config is not an error the picker should refuse to open
+	// on — its add row is how the first repo gets written. A malformed
+	// one is, since adding to it would mean rewriting it.
 	loadRepos := func() ([]string, error) {
 		c, err := config.Load(*configPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, err
 		}
-		if len(c.Repos) == 0 {
-			return nil, fmt.Errorf("%s: no repos", *configPath)
-		}
 		return c.Repos, nil
 	}
+	addRepo := func(repo string) (string, error) {
+		return config.AddRepo(*configPath, repo)
+	}
+	var arbCfg tui.ArbiterConfig
+	// Only derive a config dir from an actual config path — "" would
+	// resolve to "." via filepath.Dir and seed an arbiter/ in the cwd
+	// instead of leaving the TUI's "no config dir" guard to fire.
+	if *configPath != "" {
+		arbCfg.ConfigDir = filepath.Dir(*configPath)
+	}
+	if c, err := config.Load(*configPath); err == nil {
+		arbCfg.Model = c.Arbiter.Model
+	}
 	m := tui.New(tm, splitCmds(*cmds), hubSession, *socket,
-		os.Getenv("TMUX_PANE"), *claudeCmd, loadRepos, ttl)
+		os.Getenv("TMUX_PANE"), *claudeCmd, loadRepos, addRepo, ttl, arbCfg)
 	final, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(),
 		tea.WithMouseCellMotion()).Run()
 	if fm, ok := final.(tui.Model); ok {

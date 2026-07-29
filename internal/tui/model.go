@@ -16,6 +16,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	ansitrunc "github.com/muesli/reflow/truncate"
+	"github.com/muesli/reflow/wordwrap"
+	"github.com/muesli/reflow/wrap"
 
 	"coop/internal/hub"
 )
@@ -49,6 +51,13 @@ type retargetMsg struct {
 type resizedMsg struct{ err error }
 type borderMsg struct{ err error }
 
+// repoAddedMsg is the picker's add row landing in the config: dir is the
+// directory the typed path resolved to, ready to start a session in.
+type repoAddedMsg struct {
+	dir string
+	err error
+}
+
 type Model struct {
 	tmux       hub.Tmux
 	allowed    []string
@@ -56,6 +65,7 @@ type Model struct {
 	socket     string
 	done       *hub.DoneTracker
 	notify     *hub.NotifyTracker
+	nudge      *hub.ArbiterNudger
 	claude     *hub.ClaudeSessions // Claude Code's own per-process state
 	// transcripts reads session transcripts for the stat column; a field
 	// rather than a concrete type so tests can substitute one.
@@ -67,6 +77,9 @@ type Model struct {
 	selectedID string
 	errMsg     string
 	actionErr  string
+
+	msg       string // text currently in the footer message box
+	msgScroll int    // message box scroll offset, in wrapped lines
 
 	livePane   string // live preview pane id; "" until adopted/created
 	liveTarget string // session the live pane is attached to
@@ -81,26 +94,44 @@ type Model struct {
 	focused  bool // nav pane holds terminal focus; drives the frame colour
 	showHelp bool // ? pressed; footer shows the full key list
 
-	picking        bool     // repo picker mode
-	repos          []string // picker contents, loaded at open
-	repoFilter     string   // typed filter; narrows repos by base name
-	repoIdx        int      // index into filteredRepos(), not repos
-	pendingSession string   // session to auto-select when it appears
-	focusPending   bool     // focus the preview once it shows the new session
+	picking    bool     // repo picker mode
+	repos      []string // picker contents, loaded at open
+	repoFilter string   // typed filter; narrows repos by base name
+	// repoIdx indexes filteredRepos(), not repos — except for one past
+	// its end, which is the "+ add new repo" row pinned below the list.
+	repoIdx        int
+	adding         bool   // add-repo prompt is up, over the picker
+	repoPath       string // path typed into that prompt
+	pendingSession string // session to auto-select when it appears
+	focusPending   bool   // focus the preview once it shows the new session
 	claudeCmd      string
 	loadRepos      func() ([]string, error)
+	// addRepo writes a repo into the config and returns the directory it
+	// resolved to; nil when there is no config to write.
+	addRepo func(repo string) (string, error)
+	arb     ArbiterConfig
 
 	width, height int
 }
 
+// ArbiterConfig is what the a key needs to launch the arbiter session.
+// The zero value disables launching (a reports the missing config).
+type ArbiterConfig struct {
+	Model     string // claude model id/alias; "" means sonnet
+	ConfigDir string // dir holding arbiter.md and the arbiter/ workdir
+}
+
 func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
 	claudeCmd string, loadRepos func() ([]string, error),
-	doneTTL time.Duration) Model {
+	addRepo func(string) (string, error),
+	doneTTL time.Duration, arb ArbiterConfig) Model {
 	return Model{tmux: tm, allowed: allowed, hubSession: hubSession,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
-		loadRepos: loadRepos, done: hub.NewDoneTracker(doneTTL, tm),
-		notify: hub.NewNotifyTracker(tm), claude: hub.DefaultClaudeSessions(),
+		loadRepos: loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
+		notify: hub.NewNotifyTracker(tm), nudge: hub.NewArbiterNudger(tm, hubSession),
+		claude:      hub.DefaultClaudeSessions(),
 		transcripts: hub.DefaultTranscripts().Stats,
+		arb:         arb,
 		focused:     true, width: 80, height: 24}
 }
 
@@ -123,6 +154,7 @@ func tick() tea.Cmd {
 func (m Model) poll() tea.Cmd {
 	tm, hubSession, live := m.tmux, m.hubSession, m.livePane
 	done, notify, liveTarget := m.done, m.notify, m.liveTarget
+	nudge := m.nudge
 	claude, transcripts := m.claude, m.transcripts
 	if m.statCol == statColOff {
 		transcripts = nil // nobody is looking; don't touch the filesystem
@@ -150,6 +182,7 @@ func (m Model) poll() tea.Cmd {
 		for _, p := range notify.Apply(panes) {
 			hub.NotifySend(p.Session, cleanTitle(p.Title))
 		}
+		nudge.Apply(panes, hubs)
 		done.Apply(panes, visitedFunc(tm, hubSession, live, liveTarget), time.Now())
 		hub.SortPanes(panes)
 		liveGone := live != "" && !paneExists(all, live)
@@ -255,7 +288,10 @@ func (m Model) ensureLivePane() tea.Cmd {
 			return livePaneMsg{err: err}
 		}
 		if err = tm.SetPaneOption(id, hub.LiveMarker, "1"); err != nil {
-			return livePaneMsg{err: err}
+			// Report the id anyway: an unmarked pane the model has
+			// forgotten is one FindMarkedPane can never adopt, so the
+			// next tick would split another.
+			return livePaneMsg{id: id, err: err}
 		}
 		return livePaneMsg{id: id, err: livePaneOptions(tm, id)}
 	}
@@ -275,7 +311,12 @@ func livePaneOptions(tm hub.Tmux, id string) error {
 		borderFormat(hub.TitleText)); err != nil {
 		return err
 	}
-	return tm.SetPaneOption(id, "allow-set-title", "off")
+	// allow-set-title arrived in tmux 3.5; an older server rejects it as
+	// an invalid option. Best-effort, since the fallback is only that the
+	// inner app can overwrite the border bar until the next poll retitles
+	// it — not worth refusing to preview at all (Ubuntu 24.04 ships 3.4).
+	_ = tm.SetPaneOption(id, "allow-set-title", "off")
+	return nil
 }
 
 // borderFormat is the live pane's border bar format with the title text
@@ -391,6 +432,10 @@ func (m Model) resizeSelf() tea.Cmd {
 // so repeated presses cycle through every blocked session — answering
 // one clears its status, which is all the memory the cycle needs. ""
 // means nothing needs input.
+//
+// The arbiter is never a target: tab is for the work that is blocked on
+// you, and an arbiter at its own permission prompt is coop's problem,
+// not a session's. Its pinned row shows the status; arrow to it.
 func nextNeedsInput(panes []hub.Pane, selectedID string) string {
 	start := 0
 	for i, p := range panes {
@@ -400,7 +445,7 @@ func nextNeedsInput(panes []hub.Pane, selectedID string) string {
 		}
 	}
 	for i := range panes {
-		if p := panes[(start+i)%len(panes)]; p.Status == hub.StatusNeedsInput {
+		if p := panes[(start+i)%len(panes)]; p.Status == hub.StatusNeedsInput && !p.Arbiter {
 			return p.ID
 		}
 	}
@@ -416,7 +461,39 @@ func (m Model) indexOf(id string) int {
 	return -1
 }
 
+// Update wraps update so the message box stays in sync from one place
+// rather than from every one of update's return sites. It adds no command
+// of its own, so the single-command invariant holds.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	return next.(Model).syncMsg(), cmd
+}
+
+// syncMsg recomputes the footer message and rewinds the box whenever the
+// text changes — a new selection, a new error or a cleared note should
+// always start at the top.
+func (m Model) syncMsg() Model {
+	text, _ := m.message()
+	if text != m.msg {
+		m.msg, m.msgScroll = text, 0
+	}
+	return m
+}
+
+// message is the footer message box's contents: the most urgent of the
+// action error, the poll error and the selected row's arbiter line, with
+// the style it renders in.
+func (m Model) message() (string, lipgloss.Style) {
+	switch {
+	case m.actionErr != "":
+		return m.actionErr, errStyle
+	case m.errMsg != "":
+		return m.errMsg, errStyle
+	}
+	return m.arbiterDetail()
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -469,10 +546,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.retarget()
 
+	case repoAddedMsg:
+		if msg.err != nil {
+			// Prompt stays up, text intact — this is usually a typo.
+			m.actionErr = "add repo: " + msg.err.Error()
+			return m, nil
+		}
+		m.picking, m.adding, m.repoPath, m.repoFilter = false, false, "", ""
+		name := hub.NextSessionName(m.sessionNames(), msg.dir)
+		m.pendingSession = name
+		return m, m.createCmd(name, msg.dir)
+
 	case livePaneMsg:
 		m.ensuring = false
 		if msg.err != nil {
 			m.errMsg = "live pane: " + msg.err.Error()
+		}
+		// A pane that exists is adopted even when something else in the
+		// same command failed: forgetting it here means the next poll
+		// finds no live pane and splits another, once per tick.
+		if msg.id == "" {
 			return m, nil
 		}
 		m.livePane, m.liveTarget = msg.id, ""
@@ -572,9 +665,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleMouse selects the session under a left click. Clicks are inert
-// while the picker or a confirm prompt is up — unlike keys they don't
-// disarm, so a stray click can't eat a pending confirm.
+// handleMouse selects the row under a left click — a session in the nav,
+// a repo or the add row in the picker. A click only ever moves the
+// cursor; enter is what acts, so a stray click can't start or kill
+// anything. Clicks are inert while a confirm prompt is up, since unlike
+// keys they don't disarm and would otherwise eat the pending confirm.
 //
 // A click also stands in for the focus flip FocusMsg normally handles:
 // tmux's click binding has just made the nav the active pane, but the
@@ -590,7 +685,16 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.focused = true
 		borderCmd = m.setBorderCmd(false)
 	}
-	if m.picking || m.confirmQuit || m.confirmKillAll > 0 || m.confirmKill != "" {
+	if m.confirmQuit || m.confirmKillAll > 0 || m.confirmKill != "" {
+		return m, borderCmd
+	}
+	if m.picking {
+		// The add prompt has no rows to click, only a text field.
+		if !m.adding {
+			if i := m.pickerRowAt(msg.Y); i >= 0 {
+				m.repoIdx = i
+			}
+		}
 		return m, borderCmd
 	}
 	if id := m.paneAt(msg.Y); id != "" {
@@ -603,7 +707,8 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 // paneAt maps a terminal row to the pane rendered there, or "" for any
 // other row. It mirrors the layout frame() and viewNav() draw: border,
 // title line, blank line, then session rows with a header line opening
-// each repo group, truncated to leave room for the footer.
+// each repo group and a blank line plus divider opening the pinned
+// arbiter section, truncated to leave room for the footer.
 func (m Model) paneAt(y int) string {
 	if m.height > 0 {
 		feet := strings.Split(strings.TrimRight(m.viewFooter(), "\n"), "\n")
@@ -614,7 +719,12 @@ func (m Model) paneAt(y int) string {
 	row := y - 3 // border + title line + blank line
 	repo := ""
 	for _, p := range m.panes {
-		if r := p.Repo(); r != repo {
+		if p.Arbiter {
+			if row <= 1 {
+				return "" // blank line, then the arbiter divider
+			}
+			row -= 2
+		} else if r := p.Repo(); r != repo {
 			repo = r
 			if row == 0 {
 				return "" // repo header line
@@ -629,12 +739,47 @@ func (m Model) paneAt(y int) string {
 	return ""
 }
 
+// handleAddKey drives the add-repo prompt reached from the picker's last
+// row. The path is typed blind — there is no completion — so backspace
+// and esc are the whole edit vocabulary. A rejected path (see AddRepo)
+// leaves the prompt up with the text intact so it can be corrected.
+func (m Model) handleAddKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.adding, m.repoPath = false, ""
+	case "enter":
+		if strings.TrimSpace(m.repoPath) == "" {
+			return m, nil
+		}
+		if m.addRepo == nil {
+			m.actionErr = "no config file to add to"
+			return m, nil
+		}
+		return m, m.addRepoCmd(m.repoPath)
+	case "backspace":
+		if m.repoPath != "" {
+			r := []rune(m.repoPath)
+			m.repoPath = string(r[:len(r)-1])
+		}
+	case " ":
+		m.repoPath += " "
+	default:
+		if msg.Type == tea.KeyRunes && !msg.Alt {
+			m.repoPath += string(msg.Runes)
+		}
+	}
+	return m, nil
+}
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Any key means the user is driving the nav again — don't yank the
 	// keyboard into the preview under them.
 	m.focusPending = false
 	if m.picking {
 		m.actionErr = ""
+		if m.adding {
+			return m.handleAddKey(msg)
+		}
 		switch msg.String() {
 		case "esc":
 			// Two-stage: first esc clears the filter, second closes.
@@ -648,12 +793,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.repoIdx--
 			}
 		case "down":
-			if m.repoIdx < len(m.filteredRepos())-1 {
+			// One past the last repo is the add row, so it is reachable
+			// even when the filter matches nothing.
+			if m.repoIdx < len(m.filteredRepos()) {
 				m.repoIdx++
 			}
 		case "enter":
 			repos := m.filteredRepos()
-			if len(repos) == 0 {
+			if m.repoIdx >= len(repos) {
+				m.adding, m.repoPath = true, ""
 				return m, nil
 			}
 			dir := repos[m.repoIdx]
@@ -748,6 +896,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedID = m.panes[i+1].ID
 		}
 		return m, m.retarget()
+	case "pgup":
+		m.msgScroll = max(0, m.msgScroll-1)
+	case "pgdown":
+		// Clamp here as well as in wrapMsg: letting the offset run past the
+		// end would leave pgup pressed silently that many times over.
+		m.msgScroll = min(m.msgScroll+1, m.maxMsgScroll())
 	case "tab":
 		if id := nextNeedsInput(m.panes, m.selectedID); id != "" {
 			m.selectedID = id
@@ -768,14 +922,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.actionErr = "config: " + err.Error()
 			return m, nil
 		}
-		if len(repos) == 0 {
-			m.actionErr = "config: no repos configured"
-			return m, nil
-		}
+		// An empty list still opens the picker: its add row is the only
+		// way to configure the first repo.
 		slices.SortFunc(repos, func(a, b string) int {
 			return strings.Compare(filepath.Base(a), filepath.Base(b))
 		})
 		m.picking = true
+		m.adding, m.repoPath = false, ""
 		m.repos, m.repoFilter, m.repoIdx = repos, "", 0
 	case "x":
 		if i := m.indexOf(m.selectedID); i >= 0 {
@@ -786,6 +939,30 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// land on the next poll tick.
 		m.statCol = m.statCol.next()
 		return m, m.resizeSelf()
+	case "a":
+		// Cycle off → recommend → full → off, the s-key precedent. The
+		// session's existence IS the enabled state; mode lives on it.
+		if arb, ok := hub.FindArbiter(m.panes); ok {
+			if hub.ArbiterModeOf(arb) == hub.ArbiterModeRecommend {
+				return m, m.arbiterModeCmd(arb.Session, hub.ArbiterModeFull)
+			}
+			m.confirmKill = arb.Session // full → off: same y/esc confirm as x
+			return m, nil
+		}
+		if m.arb.ConfigDir == "" {
+			m.actionErr = "arbiter: no config dir"
+			return m, nil
+		}
+		return m, m.arbiterCreateCmd()
+	case " ":
+		// Apply the arbiter's suggestion: the same send the digit key
+		// makes, minus reading the number out of the note. Not gated on
+		// mode — a full-mode arbiter that escalated instead of answering
+		// still leaves a digit worth one key.
+		if s := m.selectedSuggest(); s != "" {
+			return m, m.answerCmd(m.selectedID, s)
+		}
+		m.actionErr = "no arbiter suggestion for this session"
 	case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		if m.selectedID != "" {
 			return m, m.answerCmd(m.selectedID, msg.String())
@@ -929,6 +1106,44 @@ func (m Model) createCmd(name, dir string) tea.Cmd {
 	}
 }
 
+// addRepoCmd writes the typed path into the config off the UI goroutine,
+// like every other bit of I/O here — the Model does not touch the disk.
+func (m Model) addRepoCmd(repo string) tea.Cmd {
+	add := m.addRepo
+	return func() tea.Msg {
+		dir, err := add(repo)
+		return repoAddedMsg{dir: dir, err: err}
+	}
+}
+
+// arbiterModeCmd flips the arbiter's mode option. Best-effort: the
+// footer shows the mode from poll data, so a miss self-heals next tick.
+func (m Model) arbiterModeCmd(session, mode string) tea.Cmd {
+	tm := m.tmux
+	return func() tea.Msg {
+		return sentMsg{err: tm.SetSessionOption(session, hub.ArbiterModeMarker, mode)}
+	}
+}
+
+// arbiterCreateCmd launches the arbiter session, sized to the live
+// preview like createCmd — same createdMsg path, so a failure lands in
+// actionErr and success triggers an immediate poll.
+func (m Model) arbiterCreateCmd() tea.Cmd {
+	tm, arb, claudeCmd, live := m.tmux, m.arb, m.claudeCmd, m.livePane
+	allowed := strings.Join(m.allowed, ",")
+	return func() tea.Msg {
+		w, h := 0, 0
+		if live != "" {
+			w, h, _ = tm.PaneSize(live)
+		}
+		model := arb.Model
+		if model == "" {
+			model = "sonnet"
+		}
+		return createdMsg{err: hub.LaunchArbiter(tm, arb.ConfigDir, allowed, claudeCmd, model, w, h)}
+	}
+}
+
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true)
 	cursorStyle = lipgloss.NewStyle().Bold(true)
@@ -979,10 +1194,10 @@ func statusGlyph(s hub.Status) string {
 // titleWidth is the row's title column, in display cells.
 const titleWidth = 32
 
-// navWidth is the nav pane's pinned width: cursor (2) + glyph and its
-// gap (2) + title column (titleWidth+1) + age ("12h34m"), plus 4 cells
-// for the frame's borders and padding — the longest row fits exactly.
-const navWidth = 47
+// navWidth is the nav pane's pinned width: cursor (2) + glyph, arbiter
+// mark, and gap (3) + title column (titleWidth+1) + age ("12h34m"),
+// plus 4 cells for the frame's borders and padding.
+const navWidth = 48
 
 // statWidth is what the optional stat column adds: the widest badge
 // ("o4.8·xh"), the numeric form being narrower.
@@ -1201,36 +1416,66 @@ func frame(title, body, foot string, focused bool, w, h int) string {
 
 func (m Model) View() string {
 	if m.picking {
-		esc := "esc cancel"
-		if m.repoFilter != "" {
-			esc = "esc clear"
-		}
-		return frame("new session", m.viewPicker(),
-			flowHints([]string{"type to filter", "↑/↓ select", "enter create", esc},
-				m.width-4),
+		return frame("new session", m.viewPicker(m.pickerBody()), m.pickerHints(),
 			m.focused, m.width, m.height)
 	}
 	return frame("sessions", m.viewNav(), m.viewFooter(),
 		m.focused, m.width, m.height)
 }
 
+// sessionCount is the header's count: the sessions being watched. The
+// arbiter is coop's own machinery — like the hub panes the poll already
+// filters out, it is not something you started and not something to
+// count. Panes, not sessions, as the header has always counted.
+func (m Model) sessionCount() int {
+	n := len(m.panes)
+	if _, ok := hub.FindArbiter(m.panes); ok {
+		n--
+	}
+	return n
+}
+
+// arbiterDivider is the pinned arbiter section's heading, filled out to
+// the nav's inner width: "─ arbiter ────…".
+func arbiterDivider(w int) string {
+	const head = "─ arbiter "
+	if n := w - lipgloss.Width(head); n > 0 {
+		return head + strings.Repeat("─", n)
+	}
+	return head
+}
+
 func (m Model) viewNav() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("coop") + "  " +
-		footStyle.Render(fmt.Sprintf("%d sessions", len(m.panes))) + "\n\n")
+		footStyle.Render(fmt.Sprintf("%d sessions", m.sessionCount())) + "\n\n")
 
-	if len(m.panes) == 0 {
+	if m.sessionCount() == 0 {
 		b.WriteString("no sessions — start one by using the n key\n")
 	}
 	repo := ""
 	for _, p := range m.panes {
-		if r := p.Repo(); r != repo {
+		if p.Arbiter {
+			// Pinned last by hub.SortPanes, under its own divider — it is
+			// coop's own infrastructure, not one of the watched repos.
+			b.WriteString("\n" + footStyle.Render(arbiterDivider(m.navCols()-4)) + "\n")
+		} else if r := p.Repo(); r != repo {
 			repo = r
 			b.WriteString(titleStyle.Render(repo) + "\n")
 		}
 		st := statusStyle(p.Status)
-		line := pad(st.Render(statusGlyph(p.Status)+" "+
-			truncate(cleanTitle(p.Title), titleWidth)), titleWidth+3) +
+		mark := " "
+		title := cleanTitle(p.Title)
+		if p.Arbiter {
+			// Claude's derived title describes whatever the arbiter last
+			// triaged, which reads as a work session in that repo. Its
+			// mode is the only thing about it worth a row.
+			title = "arbiter · " + hub.ArbiterModeOf(p)
+		} else if p.ArbiterNote != "" {
+			mark = "!" // arbiter escalated — detail line has the note
+		}
+		line := pad(st.Render(statusGlyph(p.Status)+mark+" "+
+			truncate(title, titleWidth)), titleWidth+4) +
 			age(p.Since())
 		if m.statCol != statColOff {
 			line = pad(line, navWidth-6) + footStyle.Render(statText(p, m.statCol))
@@ -1260,26 +1505,128 @@ func (m Model) filteredRepos() []string {
 	return out
 }
 
-func (m Model) viewPicker() string {
-	var b strings.Builder
-	if m.repoFilter == "" {
-		b.WriteString(footStyle.Render("pick a repo — type to filter") + "\n\n")
-	} else {
-		b.WriteString(footStyle.Render("filter: ") + m.repoFilter + "▌\n\n")
-	}
+// pickerHeadLines is the prompt line plus the blank under it — the fixed
+// top of the picker body, above both the list and the add row.
+const pickerHeadLines = 2
+
+// pickerRows is the picker body's geometry, shared by the draw and the
+// click map so what you click is always what you see. Repos take two
+// lines each (name, then dimmed path) and the add row is pinned to the
+// bottom, so a list too long for the frame scrolls under it instead of
+// pushing it out of reach.
+type pickerRows struct {
+	repos   []string // the visible slice of filteredRepos()
+	start   int      // index in filteredRepos() of repos[0]
+	note    string   // line drawn in place of an empty list; "" for none
+	addLine int      // body line (0-based) the add row is drawn on
+}
+
+// pickerLayout lays the body out for avail lines of room.
+func (m Model) pickerLayout(avail int) pickerRows {
 	repos := m.filteredRepos()
+	l := pickerRows{repos: repos}
 	if len(repos) == 0 {
-		b.WriteString(footStyle.Render("no matches") + "\n")
-	}
-	for i, r := range repos {
-		name := titleStyle.Render(filepath.Base(r))
-		if i == m.repoIdx {
-			b.WriteString(cursorStyle.Render("▸ ") + name + "\n")
-		} else {
-			b.WriteString("  " + name + "\n")
+		// With no repos at all the head already says so; "no matches"
+		// is only news when the filter is what emptied the list.
+		if len(m.repos) > 0 {
+			l.note = "no matches"
+			l.addLine++
 		}
+		l.addLine += pickerHeadLines + 1
+		return l
+	}
+	// The head, the blank above the add row and the add row itself are
+	// fixed; the list gets whatever is left.
+	fit := len(repos)
+	if room := avail - pickerHeadLines - 2; room < 2*fit {
+		fit = max(room/2, 0)
+	}
+	if fit < len(repos) {
+		// The cursor rides the bottom visible row once it passes the
+		// first page — keeps it on screen with no scroll offset to
+		// carry in the Model.
+		if cur := min(m.repoIdx, len(repos)-1); cur >= fit {
+			l.start = cur - fit + 1
+		}
+	}
+	l.repos = repos[l.start : l.start+fit]
+	l.addLine = pickerHeadLines + 2*fit + 1
+	return l
+}
+
+// pickerRowAt maps a terminal row to a picker index — a repo's index in
+// filteredRepos(), or one past the end for the add row — and -1 for any
+// other row. Like paneAt it walks the same layout the view draws.
+func (m Model) pickerRowAt(y int) int {
+	line := y - 1 // the frame's top border
+	l := m.pickerLayout(m.pickerBody())
+	if line == l.addLine {
+		return len(m.filteredRepos())
+	}
+	if line < pickerHeadLines || l.note != "" {
+		return -1
+	}
+	if i := (line - pickerHeadLines) / 2; i < len(l.repos) {
+		return l.start + i
+	}
+	return -1
+}
+
+// pickerBody is how many lines frame() will leave the picker's body:
+// the height, less the border and the hint block under it.
+func (m Model) pickerBody() int {
+	hints := strings.Count(strings.TrimRight(m.pickerHints(), "\n"), "\n") + 1
+	return max(m.height-2-hints, 0)
+}
+
+func (m Model) pickerHints() string {
+	if m.adding {
+		return flowHints([]string{"enter add & start", "esc cancel"}, m.width-4)
+	}
+	esc := "esc cancel"
+	if m.repoFilter != "" {
+		esc = "esc clear"
+	}
+	enter := "enter create"
+	if m.repoIdx >= len(m.filteredRepos()) {
+		enter = "enter add repo"
+	}
+	return flowHints([]string{"type to filter", "↑/↓ select", enter, esc},
+		m.width-4)
+}
+
+func (m Model) viewPicker(avail int) string {
+	var b strings.Builder
+	if m.adding {
+		b.WriteString(footStyle.Render("add repo: ") + m.repoPath + "▌\n\n")
+		b.WriteString(footStyle.Render("~/src/repo or /abs/path") + "\n")
+		return b.String()
+	}
+	switch {
+	case m.repoFilter != "":
+		b.WriteString(footStyle.Render("filter: ") + m.repoFilter + "▌\n\n")
+	case len(m.repos) == 0:
+		b.WriteString(footStyle.Render("no repos configured yet") + "\n\n")
+	default:
+		b.WriteString(footStyle.Render("pick a repo — type to filter") + "\n\n")
+	}
+	l := m.pickerLayout(avail)
+	if l.note != "" {
+		b.WriteString(footStyle.Render(l.note) + "\n")
+	}
+	row := func(text string, selected bool) {
+		if selected {
+			b.WriteString(cursorStyle.Render("▸ ") + text + "\n")
+		} else {
+			b.WriteString("  " + text + "\n")
+		}
+	}
+	for i, r := range l.repos {
+		row(titleStyle.Render(filepath.Base(r)), l.start+i == m.repoIdx)
 		b.WriteString("  " + footStyle.Render(tildify(r)) + "\n")
 	}
+	b.WriteString("\n")
+	row(titleStyle.Render("+ add new repo"), m.repoIdx >= len(m.filteredRepos()))
 	return b.String()
 }
 
@@ -1298,19 +1645,131 @@ func (m Model) viewFooter() string {
 	if m.confirmKill != "" {
 		return errStyle.Render("kill " + m.confirmKill + "? · y confirm · esc cancel")
 	}
-	if m.actionErr != "" {
-		return errStyle.Render(m.actionErr)
-	}
-	if m.errMsg != "" {
-		return errStyle.Render(m.errMsg)
-	}
-	hints := []string{"↑/↓ select", "enter focus", "n new", "? help"}
-	if m.showHelp {
+	inner := m.width - 4 // frame() draws "│ " and " │"
+	box, overflow := m.viewMsgBox(inner)
+
+	hints := []string{"↑/↓ select", "enter focus", "n new", m.arbiterHint(), "? help"}
+	switch {
+	case m.showHelp:
 		hints = []string{"↑/↓ select", "enter focus", "tab next input",
-			"shift+←/→ switch pane", "0-9 answer", "bksp erase",
-			"/ command", "n new", "x kill", "s stats", "q quit", "? close"}
+			"shift+←/→ switch pane", "0-9 answer", "space apply suggestion",
+			"bksp erase", "/ command", "n new", "x kill", "s stats", m.arbiterHint(),
+			"pgup/pgdn scroll msg", "q quit", "? close"}
+	default:
+		// Contextual chips, most actionable first — rows are scarce at
+		// navWidth, so neither is worth a permanent slot.
+		if overflow {
+			hints = append([]string{"pgup/pgdn scroll"}, hints...)
+		}
+		if s := m.selectedSuggest(); s != "" {
+			hints = append([]string{"space apply " + s}, hints...)
+		}
 	}
-	return flowHints(hints, m.width-4) // frame() draws "│ " and " │"
+	foot := flowHints(hints, inner)
+	if box != "" {
+		foot = box + "\n\n" + foot // blank row sets the message off the hints
+	}
+	return foot
+}
+
+// viewMsgBox renders the message wrapped to width, windowed to the visible
+// line cap, and reports whether there is more of it than fits.
+func (m Model) viewMsgBox(width int) (string, bool) {
+	text, style := m.message()
+	if text == "" {
+		return "", false
+	}
+	lines, total := wrapMsg(text, width, m.msgBoxMax(), m.msgScroll)
+	for i, l := range lines {
+		lines[i] = style.Render(l)
+	}
+	return strings.Join(lines, "\n"), total > len(lines)
+}
+
+// msgBoxMax is how many message lines the box shows at once. It gives up
+// height on a short terminal rather than squeezing the session list away.
+func (m Model) msgBoxMax() int {
+	return min(msgBoxLines, max(1, m.height/4))
+}
+
+// msgBoxLines is the message box's visible line cap on a roomy terminal.
+const msgBoxLines = 4
+
+// maxMsgScroll is the last offset that still fills the box; 0 when the
+// whole message already fits.
+func (m Model) maxMsgScroll() int {
+	if m.msg == "" {
+		return 0
+	}
+	_, total := wrapMsg(m.msg, m.width-4, m.msgBoxMax(), 0)
+	return max(0, total-m.msgBoxMax())
+}
+
+// wrapMsg word-wraps text to width and returns the window of at most max
+// lines starting at offset, along with the total wrapped line count. The
+// offset is clamped, so a stale scroll position can never blank the box.
+func wrapMsg(text string, width, max, offset int) ([]string, int) {
+	if width < 1 {
+		width = 1
+	}
+	// reflow's wordwrap breaks on '-' by default, which splits an ordinary
+	// hyphenated word ("don't-ask-again") across lines and, once the
+	// overhang meets the hard wrap below, mid-syllable. Whitespace is the
+	// only breakpoint worth having here.
+	w := wordwrap.NewWriter(width)
+	w.Breakpoints = nil
+	w.Write([]byte(text)) // buffered in memory; cannot fail
+	w.Close()
+	// wordwrap leaves a word longer than width overhanging, which frame()
+	// would then clip; wrap hard-breaks whatever is still too wide.
+	lines := strings.Split(wrap.String(w.String(), width), "\n")
+	if offset > len(lines)-max {
+		offset = len(lines) - max
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := min(offset+max, len(lines))
+	return lines[offset:end], len(lines)
+}
+
+// arbiterHint is the a key's footer chip, doubling as the mode display:
+// "a arbiter off|recommend|full".
+func (m Model) arbiterHint() string {
+	arb, ok := hub.FindArbiter(m.panes)
+	if !ok {
+		return "a arbiter off"
+	}
+	return "a arbiter " + hub.ArbiterModeOf(arb)
+}
+
+// selectedSuggest is the digit the space key would apply for the
+// selected row: the arbiter's suggestion, or "" when it has none.
+func (m Model) selectedSuggest() string {
+	i := m.indexOf(m.selectedID)
+	if i < 0 {
+		return ""
+	}
+	return hub.ArbiterSuggestOf(m.panes[i])
+}
+
+// arbiterDetail is the selected row's arbiter line: an active
+// escalation note, else the last answer, else nothing. The text comes back
+// unstyled so it can be wrapped before the style is applied per line.
+func (m Model) arbiterDetail() (string, lipgloss.Style) {
+	i := m.indexOf(m.selectedID)
+	if i < 0 {
+		return "", footStyle
+	}
+	p := m.panes[i]
+	if p.ArbiterNote != "" {
+		return "arbiter: " + p.ArbiterNote, needsStyle
+	}
+	if last, ok := hub.ParseArbiterLast(p.ArbiterLast); ok {
+		return fmt.Sprintf("answered %s by arbiter %s ago — %s",
+			last.Digit, age(last.At), last.Reason), footStyle
+	}
+	return "", footStyle
 }
 
 // flowHints packs hint items into "·"-separated lines that fit width, so

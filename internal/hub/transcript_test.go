@@ -179,3 +179,29 @@ func TestProjectSlug(t *testing.T) {
 		t.Errorf("projectSlug = %q", got)
 	}
 }
+
+func TestLastText(t *testing.T) {
+	dir := t.TempDir()
+	proj := filepath.Join(dir, "-home-user-sprocket-v2")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"older turn"}]}}`,
+		`{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"subagent noise"}]}}`,
+		`{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"May I run the migration?"},{"type":"tool_use"}]}}`,
+		`{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"tool_use"}]}}`,
+	}
+	path := filepath.Join(proj, "sess-1.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr := &Transcripts{Dir: dir}
+	got, ok := tr.LastText("sess-1", "/home/user/sprocket-v2")
+	if !ok || got != "May I run the migration?" {
+		t.Errorf("LastText = %q %v, want the last texty main-thread turn", got, ok)
+	}
+	if _, ok := tr.LastText("missing", "/home/user/sprocket-v2"); ok {
+		t.Error("found text for a missing session")
+	}
+}

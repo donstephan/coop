@@ -125,7 +125,11 @@ type transcriptLine struct {
 	IsSidechain bool   `json:"isSidechain"`
 	Effort      string `json:"effort"`
 	Message     struct {
-		Model string `json:"model"`
+		Model   string `json:"model"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
 		Usage struct {
 			InputTokens         int `json:"input_tokens"`
 			CacheCreationTokens int `json:"cache_creation_input_tokens"`
@@ -134,34 +138,44 @@ type transcriptLine struct {
 	} `json:"message"`
 }
 
-// tailStats reads the end of a transcript and reports its last main-
-// thread assistant turn. Subagent turns (isSidechain) carry their own
-// unrelated context and are skipped.
-func tailStats(path string) (TranscriptStats, bool) {
+// tailLines reads the last tailBytes of the file as whole JSONL lines
+// (the leading fragment of a mid-record cut is dropped).
+func tailLines(path string) ([]string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return TranscriptStats{}, false
+		return nil, false
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return TranscriptStats{}, false
+		return nil, false
 	}
 	start := info.Size() - tailBytes
 	if start < 0 {
 		start = 0
 	}
 	if _, err := f.Seek(start, 0); err != nil {
-		return TranscriptStats{}, false
+		return nil, false
 	}
 	buf := make([]byte, info.Size()-start)
 	n, err := readFull(f, buf)
 	if err != nil {
-		return TranscriptStats{}, false
+		return nil, false
 	}
 	lines := strings.Split(string(buf[:n]), "\n")
 	if start > 0 && len(lines) > 0 {
-		lines = lines[1:] // first line is a fragment of an earlier record
+		lines = lines[1:]
+	}
+	return lines, true
+}
+
+// tailStats reads the end of a transcript and reports its last main-
+// thread assistant turn. Subagent turns (isSidechain) carry their own
+// unrelated context and are skipped.
+func tailStats(path string) (TranscriptStats, bool) {
+	lines, ok := tailLines(path)
+	if !ok {
+		return TranscriptStats{}, false
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		var l transcriptLine
@@ -179,6 +193,45 @@ func tailStats(path string) (TranscriptStats, bool) {
 		}, true
 	}
 	return TranscriptStats{}, false
+}
+
+// LastText returns the text of the last main-thread assistant turn that
+// said anything — tool-only turns are skipped, so this is what the
+// session most recently told its user. Uncached: callers are episodic
+// (coop peek), not the 1-second poll.
+func (t *Transcripts) LastText(sessionID, cwd string) (string, bool) {
+	if t == nil || t.Dir == "" || sessionID == "" {
+		return "", false
+	}
+	t.mu.Lock()
+	path := t.find(sessionID, cwd)
+	t.mu.Unlock()
+	if path == "" {
+		return "", false
+	}
+	lines, ok := tailLines(path)
+	if !ok {
+		return "", false
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		var l transcriptLine
+		if json.Unmarshal([]byte(lines[i]), &l) != nil {
+			continue
+		}
+		if l.Type != "assistant" || l.IsSidechain {
+			continue
+		}
+		var parts []string
+		for _, c := range l.Message.Content {
+			if c.Type == "text" && c.Text != "" {
+				parts = append(parts, c.Text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n"), true
+		}
+	}
+	return "", false
 }
 
 // AttachTranscriptStats fills in each pane's Stats from stats, which is

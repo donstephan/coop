@@ -8,6 +8,7 @@ type fakeTmux struct {
 	cmd            string
 	panes          []Pane
 	err            error
+	sendErr        error // SendKeys-only failure, for tests that need the other calls to succeed
 	sent           [][]string
 	selected       []string
 	splitID        string
@@ -16,6 +17,7 @@ type fakeTmux struct {
 	killed         []string
 	killedSessions []string
 	paneOpts       map[string]string // "pane/name" -> value
+	sessionOpts    map[string]string // "session/name" -> value
 	windowOpts     map[string]string // "session/name" -> value
 	serverOpts     map[string]string // name -> value
 	titles         [][2]string       // {pane, title} per SetPaneTitle call
@@ -27,6 +29,9 @@ func (f *fakeTmux) CapturePane(pane string) (string, error) { return f.screen, f
 func (f *fakeTmux) SendKeys(pane string, keys ...string) error {
 	if f.err != nil {
 		return f.err
+	}
+	if f.sendErr != nil {
+		return f.sendErr
 	}
 	f.sent = append(f.sent, keys)
 	return nil
@@ -101,6 +106,17 @@ func (f *fakeTmux) UnsetPaneOption(pane, name string) error {
 		return f.err
 	}
 	delete(f.paneOpts, pane+"/"+name)
+	return nil
+}
+
+func (f *fakeTmux) SetSessionOption(session, name, value string) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.sessionOpts == nil {
+		f.sessionOpts = map[string]string{}
+	}
+	f.sessionOpts[session+"/"+name] = value
 	return nil
 }
 

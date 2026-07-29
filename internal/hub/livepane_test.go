@@ -65,3 +65,13 @@ func TestParseMarkedPane(t *testing.T) {
 		t.Errorf("no marked pane should give empty, got %q", got)
 	}
 }
+
+// tmux ≤ 3.4 octal-escapes the separator (see splitFields). Missing the
+// marked pane there is what made the TUI split a fresh live pane every
+// poll tick instead of adopting the one it already had.
+func TestParseMarkedPaneEscapedSeparator(t *testing.T) {
+	out := `%1\037` + "\n" + `%5\0371` + "\n" + `%9\037` + "\n"
+	if got := parseMarkedPane(out); got != "%5" {
+		t.Errorf("want %%5, got %q", got)
+	}
+}

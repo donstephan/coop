@@ -115,6 +115,25 @@ func TestSortPanesGroupsAlphabetical(t *testing.T) {
 	}
 }
 
+// The arbiter pins to the bottom whatever its workdir happens to be
+// named — sorted by repo it would land wherever the alphabet put it,
+// drifting as repos come and go.
+func TestSortPanesArbiterLast(t *testing.T) {
+	panes := []Pane{
+		{Session: "zeta", Path: "/r/zeta", Title: "✳ Claude Code"},
+		{Session: "arbiter", Path: "/r/arbiter", Arbiter: true, Title: "✳ Claude Code"},
+		{Session: "alpha", Path: "/r/alpha", Title: "✳ Claude Code"},
+	}
+	DeriveStatuses(panes, nil)
+	SortPanes(panes)
+	want := []string{"alpha", "zeta", "arbiter"}
+	for i := range want {
+		if panes[i].Session != want[i] {
+			t.Fatalf("order %v, want %v", sessions(panes), want)
+		}
+	}
+}
+
 func sessions(panes []Pane) []string {
 	var s []string
 	for _, p := range panes {
@@ -278,5 +297,25 @@ func TestNeedsInputScreenWithANSICapture(t *testing.T) {
 	ansiIdle := "\x1b[38;5;246m❯ \x1b[39m\n\x1b[2m⏸ manual mode on · ? for shortcuts\x1b[0m\n"
 	if NeedsInputScreen(ansiIdle) {
 		t.Error("ANSI-wrapped idle caret must not be detected")
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	in := "\x1b[1mbold\x1b[0m and \x1b]0;title\x07plain"
+	if got := StripANSI(in); got != "bold and plain" {
+		t.Errorf("StripANSI = %q", got)
+	}
+}
+
+func TestDialogLine(t *testing.T) {
+	screen := "some earlier output\n\n" +
+		"Do you want to run go test?\n" +
+		"\x1b[36m❯ 1. Yes\x1b[0m\n" +
+		"  2. No\n"
+	if got := DialogLine(screen); got != "Do you want to run go test?" {
+		t.Errorf("DialogLine = %q", got)
+	}
+	if got := DialogLine("no dialog here\njust text\n"); got != "" {
+		t.Errorf("DialogLine on plain text = %q", got)
 	}
 }

@@ -112,8 +112,48 @@ func DeriveStatuses(panes []Pane, capture func(pane string) (string, error)) {
 // in alphabetical order, rows within a group in tmux's own order
 // (stable). Status never moves a row — a jumpy list is worse than a
 // glance at the status column, and tab jumps to whatever needs input.
+//
+// The arbiter always sorts last, whatever its workdir is named. It is
+// coop's own infrastructure, not work, so it gets a pinned row under
+// the list rather than drifting through the repo groups alphabetically;
+// the nav and paneAt both take "the arbiter is at the bottom" from here.
 func SortPanes(panes []Pane) {
 	sort.SliceStable(panes, func(i, j int) bool {
+		if panes[i].Arbiter != panes[j].Arbiter {
+			return !panes[i].Arbiter
+		}
 		return panes[i].Repo() < panes[j].Repo()
 	})
+}
+
+// StripANSI removes CSI and OSC escape sequences — capture-pane -e
+// output, for consumers that need plain text (coop peek, DialogLine).
+func StripANSI(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+// numberedRow matches any dialog option row, selected ("❯ 1. Yes") or
+// not ("  2. No") — the lines DialogLine must walk past to find the
+// question above them.
+var numberedRow = regexp.MustCompile(`^\s*(❯\s*)?\d+\.\s`)
+
+// DialogLine returns the dialog's question — the nearest non-empty,
+// non-option line above the first selected option row — or "" when the
+// screen shows no dialog. Feeds the audit log's dialog excerpt.
+func DialogLine(screen string) string {
+	screen = StripANSI(screen)
+	screen = strings.ReplaceAll(screen, " ", " ") // Claude pads the caret with NBSP
+	lines := strings.Split(screen, "\n")
+	for i, l := range lines {
+		if !dialogOption.MatchString(l) {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			if s := strings.TrimSpace(lines[j]); s != "" && !numberedRow.MatchString(lines[j]) {
+				return s
+			}
+		}
+		return ""
+	}
+	return ""
 }

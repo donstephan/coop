@@ -16,8 +16,8 @@ import (
 // fields are user options (@coop, @coop_working,
 // @coop_done_since, @coop_notified), empty when unset.
 func TestParsePanes(t *testing.T) {
-	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\n" +
-		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\n"
+	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
+		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n"
 	panes := parsePanes(out)
 	if len(panes) != 2 {
 		t.Fatalf("got %d panes, want 2", len(panes))
@@ -43,13 +43,13 @@ func TestParsePanes(t *testing.T) {
 }
 
 func TestParsePanesDoneSince(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].DoneSince.Equal(time.Unix(1753286000, 0)) {
 		t.Fatalf("done-since should parse as unix time, got %+v", panes)
 	}
 	// Unset and garbage both read as zero — badge simply not armed.
 	for _, raw := range []string{"", "notanumber"} {
-		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\n")
+		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 		if len(panes) != 1 || !panes[0].DoneSince.IsZero() {
 			t.Fatalf("done-since %q should yield zero time, got %+v", raw, panes)
 		}
@@ -58,7 +58,7 @@ func TestParsePanesDoneSince(t *testing.T) {
 
 func TestParsePanesSkipsMalformed(t *testing.T) {
 	out := "garbage line with no separators\n" +
-		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\n" +
+		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
 		"\n"
 	panes := parsePanes(out)
 	if len(panes) != 1 || panes[0].Session != "ok" {
@@ -67,7 +67,7 @@ func TestParsePanesSkipsMalformed(t *testing.T) {
 }
 
 func TestParsePanesBadTimestamp(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].Created.IsZero() {
 		t.Fatalf("bad timestamp should yield zero time, got %+v", panes)
 	}
@@ -76,9 +76,42 @@ func TestParsePanesBadTimestamp(t *testing.T) {
 // An unreadable pid reads as 0 — no session file lookup, so the pane
 // falls back to title-derived status.
 func TestParsePanesBadPID(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || panes[0].PID != 0 {
 		t.Fatalf("bad pid should yield 0, got %+v", panes)
+	}
+}
+
+// tmux ≤ 3.4 renders the \x1f separator as the four characters \037 in
+// -F output (Ubuntu 24.04 ships 3.4), so the same line has to parse both
+// ways or every pane is dropped and the nav shows nothing.
+func TestParsePanesEscapedSeparator(t *testing.T) {
+	// Field order is paneFormat's; the trailing user options are unset.
+	line := func(f ...string) string {
+		return strings.Join(append(f, make([]string, 19-len(f))...), `\037`)
+	}
+	out := line("roost", "%0", "795186", "✻ coop", "0", "coop",
+		"1753279140", "/home/user/coop", "1") + "\n" +
+		line("sprocket-v2", "%8", "920957", "⠂ Simplify tmux session management",
+			"1", "claude", "1753286474", "/home/user/sprocket-v2", "", "1", "", "1") + "\n"
+	panes := parsePanes(out)
+	if len(panes) != 2 {
+		t.Fatalf("got %d panes, want 2", len(panes))
+	}
+	want := Pane{
+		Session: "sprocket-v2", ID: "%8", PID: 920957,
+		Title: "⠂ Simplify tmux session management",
+		Bell:  true, Cmd: "claude",
+		Path:         "/home/user/sprocket-v2",
+		Created:      time.Unix(1753286474, 0),
+		WorkingMark:  true,
+		NotifiedMark: true,
+	}
+	if panes[1] != want {
+		t.Fatalf("got %+v\nwant %+v", panes[1], want)
+	}
+	if !panes[0].Hub {
+		t.Fatal("pane 0 is the hub")
 	}
 }
 
@@ -92,6 +125,20 @@ func TestParseSessions(t *testing.T) {
 	want := []SessionInfo{
 		{Name: "roost", Attached: true, Hub: true},
 		{Name: "roost-2", Attached: false, Hub: true},
+		{Name: "sprocket-v2", Attached: false, Hub: false},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %+v\nwant %+v", got, want)
+	}
+}
+
+// Same escaped separator as TestParsePanesEscapedSeparator: on tmux ≤ 3.4
+// the launcher sees no sessions at all, so it can neither reuse a
+// detached hub nor pick a free name.
+func TestParseSessionsEscapedSeparator(t *testing.T) {
+	got := parseSessions(`roost\0371\0371` + "\n" + `sprocket-v2\0370\037` + "\n")
+	want := []SessionInfo{
+		{Name: "roost", Attached: true, Hub: true},
 		{Name: "sprocket-v2", Attached: false, Hub: false},
 	}
 	if !slices.Equal(got, want) {
@@ -151,5 +198,25 @@ func TestIsNoServer(t *testing.T) {
 	}
 	if isNoServer(nil) {
 		t.Error("isNoServer(nil) should be false")
+	}
+}
+
+func TestParsePanesArbiterFields(t *testing.T) {
+	line := "arbiter\x1f%9\x1f42\x1ftitle\x1f0\x1fclaude\x1f1700000000\x1f/home/user/.config/coop/arbiter\x1f\x1f\x1f\x1f" +
+		"\x1f1\x1ffull\x1f1\x1f1\x1fasking to run tests\x1f1\x1f1|1700000100|approved tests"
+	panes := parsePanes(line)
+	if len(panes) != 1 {
+		t.Fatalf("got %d panes, want 1", len(panes))
+	}
+	p := panes[0]
+	if !p.Arbiter || p.ArbiterMode != "full" || !p.ArbiterSeen || !p.ArbiterNudgedMark {
+		t.Errorf("arbiter fields = %v %q %v %v, want true full true true",
+			p.Arbiter, p.ArbiterMode, p.ArbiterSeen, p.ArbiterNudgedMark)
+	}
+	if p.ArbiterNote != "asking to run tests" || p.ArbiterSuggest != "1" {
+		t.Errorf("note = %q, suggest = %q", p.ArbiterNote, p.ArbiterSuggest)
+	}
+	if p.ArbiterLast != "1|1700000100|approved tests" {
+		t.Errorf("last = %q", p.ArbiterLast)
 	}
 }

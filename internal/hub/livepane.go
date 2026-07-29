@@ -46,7 +46,7 @@ func parseClientFlags(out string) bool {
 // parseMarkedPane extracts the pane id whose user option value is "1".
 func parseMarkedPane(out string) string {
 	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Split(line, "\x1f"); len(f) == 2 && f[1] == "1" {
+		if f := splitFields(line); len(f) == 2 && f[1] == "1" {
 			return f[0]
 		}
 	}

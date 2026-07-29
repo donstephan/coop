@@ -70,6 +70,15 @@ done
 [ -n "$live" ] || { echo "FAIL: live pane never created" >&2; exit 1; }
 echo "ok: live pane created ($live)"
 
+# …and exactly one, tick after tick. Anything that loses the pane id
+# (an unknown option, an unparsed marker) makes the next poll split
+# another, one per second until the window runs out of width.
+sleep 3
+n="$(tmux -L "$SOCKET" list-panes -s -t hub -F '#{pane_id}' | wc -l)"
+[ "$n" -eq 2 ] || {
+  echo "FAIL: hub window has $n panes, want 2 (nav + one live pane)" >&2; exit 1; }
+echo "ok: live pane not re-split on later polls"
+
 # The nav pane is the hub window's other pane (the TUI itself). Keys and
 # captures must target it explicitly: creating a session auto-focuses the
 # preview, so the session's active pane doesn't stay on the nav.
@@ -142,6 +151,50 @@ done
 tmux -L "$SOCKET" has-session -t "=newproj" 2>/dev/null \
   && { echo "FAIL: newproj session survived kill" >&2; exit 1; }
 echo "ok: kill from hub"
+
+# Add a repo from the picker: the last row takes a path, writes it to
+# config.json and starts a session there. The write is the real one —
+# unit tests stub it, so this is where the wiring is proven.
+mkdir -p "$TMPD/addproj"
+tmux -L "$SOCKET" send-keys -t "$nav" "n"
+wait_for "add new repo" "$nav"
+tmux -L "$SOCKET" send-keys -t "$nav" Down Down Enter   # past newproj to the add row
+wait_for "add repo:" "$nav"
+tmux -L "$SOCKET" send-keys -t "$nav" "$TMPD/addproj" Enter
+for _ in $(seq 40); do
+  tmux -L "$SOCKET" has-session -t "=addproj" 2>/dev/null && break
+  sleep 0.25
+done
+tmux -L "$SOCKET" has-session -t "=addproj" 2>/dev/null \
+  || { echo "FAIL: addproj session never created" >&2
+       tmux -L "$SOCKET" capture-pane -p -t "$nav" >&2; exit 1; }
+grep -q "$TMPD/addproj" "$TMPD/config.json" \
+  || { echo "FAIL: repo not written to config: $(cat "$TMPD/config.json")" >&2; exit 1; }
+echo "ok: add repo from picker"
+
+# Arbiter helper CLI. A fake arbiter session (marked, mode full) passes
+# the mode gate, so the refusal under test is the allowed-cmds gate: the
+# stub pane runs sleep, which quick-send must never target.
+tmux -L "$SOCKET" new-session -d -s arb -c "$TMPD" "sleep 300"
+tmux -L "$SOCKET" set-option -t arb: @coop_arbiter 1
+tmux -L "$SOCKET" set-option -t arb: @coop_arbiter_mode full
+# -audit and -allowed-cmds aren't flags (the arbiter's Bash(coop
+# <verb>:*) permissions don't match env-prefixed commands, so the
+# operator's env is the only place these gates can come from).
+# COOP_ALLOWED_CMDS unset here defaults to claude,node, which the
+# sleep pane still fails.
+if out="$(XDG_STATE_HOME="$TMPD/state" /tmp/coop-e2e answer -socket "$SOCKET" stub 1 gate test 2>&1)"; then
+  echo "FAIL: coop answer succeeded against a sleep pane" >&2; exit 1
+fi
+echo "$out" | grep -q "refusing" || { echo "FAIL: unexpected refusal: $out" >&2; exit 1; }
+echo "ok: coop answer refused a non-claude pane"
+
+# With the command allowed, the digit lands and the audit line appears.
+XDG_STATE_HOME="$TMPD/state" COOP_ALLOWED_CMDS=sleep /tmp/coop-e2e answer -socket "$SOCKET" \
+  stub 1 approving stub dialog
+grep -q '"action":"answered"' "$TMPD/state/coop/arbiter-audit.jsonl" \
+  || { echo "FAIL: no audit entry" >&2; exit 1; }
+echo "ok: coop answer sent the digit and audited it"
 
 # Quit (q arms, y confirms) must kill the live pane so the hub session
 # ends with the TUI.

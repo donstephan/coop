@@ -32,6 +32,7 @@ type Tmux interface {
 	KillSession(name string) error
 	SetPaneOption(pane, name, value string) error
 	UnsetPaneOption(pane, name string) error
+	SetSessionOption(session, name, value string) error
 	SetWindowOption(session, name, value string) error
 	SetServerOption(name, value string) error
 	SetPaneTitle(pane, title string) error
@@ -65,6 +66,14 @@ type Pane struct {
 	WorkingMark  bool      // @coop_working — pane was working last poll
 	DoneSince    time.Time // @coop_done_since — when it finished (zero if unset)
 	NotifiedMark bool      // @coop_notified — this needs-input episode was announced
+
+	Arbiter           bool   // @coop_arbiter — the arbiter's own session
+	ArbiterMode       string // @coop_arbiter_mode — "" off the arbiter session
+	ArbiterSeen       bool   // @coop_arbiter_seen — survived a poll, safe to type at
+	ArbiterNudgedMark bool   // @coop_arbiter_nudged
+	ArbiterNote       string // @coop_arbiter_note — "" when none
+	ArbiterSuggest    string // @coop_arbiter_suggest — digit the note suggests, "" when none
+	ArbiterLast       string // @coop_arbiter_last — "" when never answered
 }
 
 // Repo is the pane's repo group: the session start directory's basename.
@@ -117,11 +126,44 @@ const (
 	WorkingMarker   = "@coop_working"
 	DoneSinceMarker = "@coop_done_since"
 	NotifiedMarker  = "@coop_notified"
+
+	// Arbiter state. The first three live on the arbiter's own session
+	// (readable from its panes via format inheritance, like HubMarker);
+	// the rest live on the tracked panes, same lifetime rules as the
+	// done/notify markers above.
+	ArbiterMarker       = "@coop_arbiter"        // "1" on the arbiter session
+	ArbiterModeMarker   = "@coop_arbiter_mode"   // "recommend" | "full"
+	ArbiterSeenMarker   = "@coop_arbiter_seen"   // arbiter outlived a poll (see ArbiterNudger)
+	ArbiterNudgedMarker = "@coop_arbiter_nudged" // this needs-input episode was nudged
+	ArbiterNoteMarker   = "@coop_arbiter_note"   // escalation note shown on the row
+	// ArbiterSuggestMarker is the digit that note's -suggest named, kept
+	// apart from the note text so the space key applies a field rather
+	// than a number parsed out of prose.
+	ArbiterSuggestMarker = "@coop_arbiter_suggest"
+	ArbiterLastMarker    = "@coop_arbiter_last" // "digit|unix|reason" of the last answer
 )
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterSeenMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}"
+
+// escapedSep is what tmux ≤ 3.4 prints instead of the \x1f separator:
+// those versions run -F output through vis(3), so every non-printable
+// byte comes back as its octal escape. tmux 3.5 stopped escaping and
+// emits the raw byte.
+const escapedSep = `\037`
+
+// splitFields splits one line of -F output on the field separator,
+// whichever form the server used. A 3.4 server escapes every separator
+// on the line, so seeing a raw \x1f anywhere means this is unescaped
+// output and the literal text "\037" (if a title somehow held it) is
+// data, not a separator.
+func splitFields(line string) []string {
+	if strings.Contains(line, "\x1f") {
+		return strings.Split(line, "\x1f")
+	}
+	return strings.Split(line, escapedSep)
+}
 
 // unixTime parses a "#{...}" unix-seconds field; anything unparseable
 // (including unset = "") reads as the zero time.
@@ -136,8 +178,8 @@ func unixTime(s string) time.Time {
 func parsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
-		f := strings.Split(line, "\x1f")
-		if len(f) != 12 {
+		f := splitFields(line)
+		if len(f) != 19 {
 			continue
 		}
 		pid, _ := strconv.Atoi(f[2]) // unreadable pid = 0 = no state lookup
@@ -146,6 +188,9 @@ func parsePanes(out string) []Pane {
 			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
 			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
 			NotifiedMark: f[11] == "1",
+			Arbiter:      f[12] == "1", ArbiterMode: f[13], ArbiterSeen: f[14] == "1",
+			ArbiterNudgedMark: f[15] == "1", ArbiterNote: f[16],
+			ArbiterSuggest: f[17], ArbiterLast: f[18],
 		})
 	}
 	return panes
@@ -164,7 +209,7 @@ const sessionFormat = "#{session_name}\x1f#{session_attached}\x1f#{" + HubMarker
 func parseSessions(out string) []SessionInfo {
 	var sessions []SessionInfo
 	for _, line := range strings.Split(out, "\n") {
-		f := strings.Split(line, "\x1f")
+		f := splitFields(line)
 		if len(f) != 3 {
 			continue
 		}

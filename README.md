@@ -47,8 +47,9 @@ screen where:
    your keyboard in the live view and type freely. `Shift+←` brings focus
    back to the list.
 
-Tip: add your repos to `~/.config/coop/config.json` so the `n` picker knows
-about them:
+Tip: the `n` picker's last row is `+ add new repo` — pick it, type a path,
+and the repo is written to `~/.config/coop/config.json` before the session
+starts. You can also fill the list in by hand:
 
 ```json
 {
@@ -65,9 +66,11 @@ about them:
 | `Enter` | focus the live view of the selected session |
 | `Shift+←/→` | switch between the session list and the live view |
 | `0-9` | pass the digit to the selected session (answers dialogs; otherwise lands in the input box) |
+| `Space` | apply the digit the arbiter suggested for the selected session |
 | `Backspace` | pass backspace to the selected session (erase a stray digit) |
 | `/` | start a slash command in the selected session (types `/` there, then focuses the live view) |
-| `n` | create a new session (repo picker) |
+| `n` | create a new session (repo picker; its last row adds a repo to the config) |
+| `a` | cycle the arbiter: off → recommend → full → off (turning off confirms like `x`) |
 | `x` | kill the selected session (`y` confirms, `esc` cancels) |
 | `q` | quit (`y` quits, `k` kills all sessions & quits, `esc` cancels; `ctrl+c` quits immediately). `k` asks again if sessions are still working. |
 | `?` | toggle the full key list in the footer |
@@ -76,6 +79,67 @@ Digit/backspace passthrough refuses unless the pane is running an allowed
 command (`-allowed-cmds`, default `claude,node`) — so a dead claude's shell
 never receives stray keystrokes.
 
+## Arbiter
+
+Some needs-input dialogs are routine under a standing policy ("yes, run
+the tests") and don't need a human keystroke. **Step zero, before turning
+this on:** tighten your per-repo Claude Code permission allowlists —
+deterministic settings should eat the truly routine prompts, and the
+arbiter is for the genuinely ambiguous residue that's left over, not a
+substitute for `settings.json`.
+
+Press `a` to cycle a real `claude --model sonnet` session — named
+`arbiter`, visible in the list like any other session, selectable and
+killable — through **off → recommend → full → off**:
+
+- `recommend` starts the arbiter but it only annotates a dialog with a
+  suggestion, never answers it.
+- `full` lets it answer numbered dialogs (a single digit) under policy.
+  Free-text prompts always get triage only — the arbiter never types
+  prose into a session.
+- Cycling back to off kills the arbiter session behind the same confirm
+  `x` uses (`y` confirms, `esc` cancels).
+
+Its judgment comes from `~/.config/coop/arbiter.md`, a freeform markdown
+policy file seeded on first launch with a conservative template (escalate
+unless clearly routine; never approve pushes, deletes, installs, or
+anything irreversible). The arbiter is stateless between episodes, so
+edits only take effect on restart — kill it (`a`, `y`) and press `a`
+again.
+
+When it escalates, the selected session's row gets a marker and a
+one-line detail underneath it — `arbiter: <note>` — until the session
+leaves needs-input; when it answers, that line instead reads
+`answered <digit> by arbiter <age> ago`.
+
+An escalation about a numbered dialog usually names the option the
+arbiter would have picked. When it does, the footer offers
+`space apply <digit>` and `Space` sends that digit — the recommend-mode
+loop is read the note, press one key. It goes out through the same
+allowed-command gate as the digit keys, and the suggestion is dropped as
+soon as the session stops needing input, so `Space` can't replay a stale
+answer.
+
+Every action, answered or escalated, is appended to
+`~/.local/state/coop/arbiter-audit.jsonl` — a durable record coop itself
+never reads.
+
+The arbiter's only hands are a helper CLI, also usable by you:
+`coop peek <session>` (read the dialog and last transcript turn),
+`coop answer <session> <digit> <reason...>` (send a digit and audit it),
+`coop note [-suggest N] <session> <text...>` (leave an escalation note,
+optionally naming the digit `Space` applies). `answer` is
+the only write path, and it's gated server-side regardless of what the
+model attempts: it refuses coop's own sessions and the arbiter itself, a
+pane whose current command isn't in the allowlist, a screen not
+currently showing a dialog, and any attempt in `recommend` mode.
+`-suggest` is not one of those gates — nothing is sent until you press
+the key — so it is an ordinary flag. The
+helper CLI otherwise takes only `-socket`; the audit path and allowlist come from
+the environment (`XDG_STATE_HOME`, `COOP_ALLOWED_CMDS` — the arbiter
+session inherits the hub's `-allowed-cmds` value), never from flags the
+model could pass itself.
+
 ## Config
 
 | Flag | Env | Default | Meaning |
@@ -83,14 +147,17 @@ never receives stray keystrokes.
 | `-socket` | `COOP_SOCKET` | `coop` | tmux socket name (`tmux -L`) |
 | `-allowed-cmds` | `COOP_ALLOWED_CMDS` | `claude,node` | commands quick-send may target |
 | `-done-ttl` | `COOP_DONE_TTL` | `5m` | how long a finished session shows `done` before decaying to idle (`0` disables) |
+| `arbiter.model` (config.json) | — | `sonnet` | model the arbiter session runs (`claude --model <model>`) |
 
 `~/.config/coop/config.json` holds the repo list for the `n` picker and,
-optionally, tmux overrides (see below):
+optionally, tmux overrides (see below). The picker's `+ add new repo` row
+appends to `repos`; anything else in the file is left as you wrote it:
 
 ```json
 {
   "repos": ["~/proj/foo"],
-  "tmux": ["set -g history-limit 100000", "set -g mouse off"]
+  "tmux": ["set -g history-limit 100000", "set -g mouse off"],
+  "arbiter": {"model": "sonnet"}
 }
 ```
 
