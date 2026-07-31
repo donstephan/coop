@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -98,7 +99,7 @@ func tmuxDefaults() [][]string {
 // overrides (config.json "tmux", split into words — last wins) are
 // chained before new-session so the hub pane itself is born under them;
 // -f /dev/null keeps the user's personal tmux.conf off this socket.
-func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, overrides [][]string, name string) []string {
+func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks bool, overrides [][]string, name string) []string {
 	argv := []string{"tmux", "-L", socket, "-f", os.DevNull, "start-server"}
 	for _, c := range tmuxDefaults() {
 		argv = append(append(argv, ";"), c...)
@@ -109,6 +110,7 @@ func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, override
 	return append(argv, ";", "new-session", "-d", "-s", name,
 		self, "-socket", socket, "-allowed-cmds", cmds,
 		"-config", cfgPath, "-claude-cmd", claudeCmd, "-done-ttl", doneTTL,
+		"-hooks="+strconv.FormatBool(hooks),
 		";", "set-option", "-t", name+":", hub.HubMarker, "1")
 }
 
@@ -143,7 +145,7 @@ func nextHubName(sessions []hub.SessionInfo) string {
 // launchIntoTmux puts this terminal into a hub session and never
 // returns on success: reattach a detached hub if one exists, else
 // create a fresh one (retrying past name races) and attach to it.
-func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL string, overrides [][]string) error {
+func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks bool, overrides [][]string) error {
 	tmuxBin, err := exec.LookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux not found in PATH: %w", err)
@@ -163,7 +165,7 @@ func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL 
 		for tries := 0; ; tries++ {
 			name = nextHubName(sessions)
 			argv := createArgv(self, socket, cmds, cfgPath, claudeCmd,
-				doneTTL, overrides, name)
+				doneTTL, hooks, overrides, name)
 			out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
 			if err == nil {
 				break
@@ -181,6 +183,12 @@ func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL 
 }
 
 func main() {
+	// The hook subcommand is Claude Code calling home on every event;
+	// it must stay silent and fast, so it bypasses everything.
+	if isHookCmd(os.Args[1:]) {
+		os.Exit(runHookCLI(os.Stdin, os.Getenv))
+	}
+
 	// Helper subcommands (the arbiter's tools) bypass the TUI entirely.
 	if isArbiterCmd(os.Args[1:]) {
 		os.Exit(runArbiterCLI(os.Args[1:], os.Stdout, os.Stderr))
@@ -196,6 +204,9 @@ func main() {
 		"command run in sessions created from the picker")
 	doneTTL := flag.String("done-ttl", envOr("COOP_DONE_TTL", "5m"),
 		"how long a finished session shows done before decaying to idle (0 disables)")
+	hooksEnv := envOr("COOP_HOOKS", "1")
+	hooks := flag.Bool("hooks", hooksEnv != "0" && hooksEnv != "false",
+		"inject status-publishing hooks into sessions created from the picker (COOP_HOOKS=0 or false disables)")
 	flag.Parse()
 
 	ttl, err := time.ParseDuration(*doneTTL)
@@ -213,7 +224,7 @@ func main() {
 		}
 		// launchIntoTmux ends in exec on success — reaching here is failure.
 		err = launchIntoTmux(tm, *socket, *cmds, *configPath, *claudeCmd,
-			*doneTTL, overrides)
+			*doneTTL, *hooks, overrides)
 		fmt.Fprintln(os.Stderr, "coop:", err)
 		os.Exit(1)
 	}
@@ -232,6 +243,21 @@ func main() {
 	// Cosmetic only — a failed style setup must not stop the hub.
 	if err := hub.ApplyHubStyle(tm, hubSession, os.Getenv("TMUX_PANE")); err != nil {
 		fmt.Fprintln(os.Stderr, "coop: style:", err)
+	}
+	// Inject the status-publishing hooks into every session this hub
+	// launches. Best-effort: a failed write just means new sessions run
+	// on the title fallback, same as sessions from before the upgrade.
+	launchCmd := *claudeCmd
+	if *hooks {
+		if p := hub.DefaultHookSettingsPath(); p != "" {
+			if exe, err := os.Executable(); err == nil {
+				if werr := hub.WriteHookSettings(p, exe); werr == nil {
+					launchCmd = hub.WithHookSettings(*claudeCmd, p)
+				} else {
+					fmt.Fprintln(os.Stderr, "coop: hook settings:", werr)
+				}
+			}
+		}
 	}
 	// A missing config is not an error the picker should refuse to open
 	// on — its add row is how the first repo gets written. A malformed
@@ -260,7 +286,7 @@ func main() {
 		arbCfg.Model = c.Arbiter.Model
 	}
 	m := tui.New(tm, splitCmds(*cmds), hubSession, *socket,
-		os.Getenv("TMUX_PANE"), *claudeCmd, loadRepos, addRepo, ttl, arbCfg)
+		os.Getenv("TMUX_PANE"), launchCmd, loadRepos, addRepo, ttl, arbCfg)
 	final, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(),
 		tea.WithMouseCellMotion()).Run()
 	if fm, ok := final.(tui.Model); ok {

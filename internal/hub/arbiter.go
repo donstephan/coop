@@ -367,7 +367,7 @@ func Note(tm Tmux, req NoteReq) (string, error) {
 // Peek is the arbiter's read path: the session's visible screen (ANSI
 // stripped) plus, when the transcript is resolvable, the last assistant
 // message — the context a dialog usually refers to.
-func Peek(tm Tmux, tr *Transcripts, cs *ClaudeSessions, session string) (string, error) {
+func Peek(tm Tmux, tr *Transcripts, session string) (string, error) {
 	panes, err := tm.ListSessions()
 	if err != nil {
 		return "", err
@@ -383,8 +383,8 @@ func Peek(tm Tmux, tr *Transcripts, cs *ClaudeSessions, session string) (string,
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== screen (%s) ===\n%s\n", session,
 		strings.TrimRight(StripANSI(screen), "\n"))
-	if st := cs.Lookup(p.PID); st != nil {
-		if text, ok := tr.LastText(st.SessionID, st.CWD); ok {
+	if c := p.Claude; c != nil && c.SessionID != "" {
+		if text, ok := tr.LastText(c.SessionID, c.CWD); ok {
 			fmt.Fprintf(&b, "\n=== last assistant message ===\n%s\n", text)
 		}
 	}

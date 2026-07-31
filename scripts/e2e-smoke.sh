@@ -18,10 +18,12 @@ printf '{"repos": ["%s"]}\n' "$TMPD/newproj" > "$TMPD/config.json"
 cd "$(dirname "$0")/.."
 go build -o /tmp/coop-e2e ./cmd/coop
 
-# Stub "claude": prints a Claude-style dialog (❯-caret option row — the
-# screen-capture fallback derives NEEDS INPUT from it; the bell can't
-# latch because the hub's live pane is a client viewing this session),
-# then sleeps to keep the pane alive.
+# Stub "claude": prints a Claude-style dialog, then publishes waiting
+# the way a real session's injected hooks would — piping a
+# PermissionRequest payload through the real `coop hook`, which finds
+# the socket in $TMUX and writes @coop_claude_status onto this pane.
+# The dialog text still matters: the answer gate reads it off the
+# screen, and the nested live client renders it.
 # The initial sleep gives us time to enable monitor-bell BEFORE the bell
 # rings (the first new-session is also what starts the throwaway server).
 # Sessions get distinct start dirs: the TUI groups by session_path
@@ -29,12 +31,12 @@ go build -o /tmp/coop-e2e ./cmd/coop
 # what wait_for finds in the list.
 mkdir -p "$TMPD/stub" "$TMPD/zstub"
 tmux -L "$SOCKET" new-session -d -s stub -c "$TMPD/stub" \
-  "sleep 1; printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n\a'; sleep 300"
+  "sleep 1; printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n\a'; printf '{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"stub\",\"cwd\":\"$TMPD/stub\"}' | /tmp/coop-e2e hook; sleep 300"
 tmux -L "$SOCKET" set -g monitor-bell on
 
 # The hub TUI in its own session on the same socket.
 tmux -L "$SOCKET" new-session -d -s hub -x 100 -y 30 \
-  "/tmp/coop-e2e -socket '$SOCKET' -allowed-cmds sleep,sh,bash -config '$TMPD/config.json' -claude-cmd 'sleep 300'"
+  "/tmp/coop-e2e -socket '$SOCKET' -allowed-cmds sleep,sh,bash -config '$TMPD/config.json' -claude-cmd 'sleep 300' -hooks=false"
 
 wait_for() { # wait_for <pattern> <pane>
   for _ in $(seq 40); do

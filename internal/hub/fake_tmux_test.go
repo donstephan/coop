@@ -109,6 +109,10 @@ func (f *fakeTmux) UnsetPaneOption(pane, name string) error {
 	return nil
 }
 
+func (f *fakeTmux) PaneOption(pane, name string) (string, error) {
+	return f.paneOpts[pane+"/"+name], f.err
+}
+
 func (f *fakeTmux) SetSessionOption(session, name, value string) error {
 	if f.err != nil {
 		return f.err

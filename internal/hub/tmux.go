@@ -32,6 +32,7 @@ type Tmux interface {
 	KillSession(name string) error
 	SetPaneOption(pane, name, value string) error
 	UnsetPaneOption(pane, name string) error
+	PaneOption(pane, name string) (string, error)
 	SetSessionOption(session, name, value string) error
 	SetWindowOption(session, name, value string) error
 	SetServerOption(name, value string) error
@@ -44,7 +45,7 @@ type Tmux interface {
 type Pane struct {
 	Session string
 	ID      string // tmux pane id, e.g. "%0"
-	PID     int    // pane_pid — keys Claude Code's session state file
+	PID     int    // pane_pid — unused by status derivation; kept for diagnostics
 	Title   string // pane_title — Claude Code encodes its state here
 	Bell    bool   // window_bell_flag — set when the pane rang the bell
 	Cmd     string // pane_current_command
@@ -52,8 +53,8 @@ type Pane struct {
 	Created time.Time
 	Status  Status // filled by DeriveStatuses, not by parsing
 
-	// Claude Code's own published state for this pane's process, when it
-	// publishes one (see ClaudeSessions). Nil for everything else.
+	// The hook-published state for this pane's claude, when its session
+	// carries the injected hooks (see hook.go). Nil for everything else.
 	Claude *ClaudeState
 
 	// Stats from the session's transcript, filled only when the TUI is
@@ -141,11 +142,20 @@ const (
 	// than a number parsed out of prose.
 	ArbiterSuggestMarker = "@coop_arbiter_suggest"
 	ArbiterLastMarker    = "@coop_arbiter_last" // "digit|unix|reason" of the last answer
+
+	// Hook-published Claude state (see hook.go): the injected coop
+	// hooks write these onto their own pane; the poll reads them back
+	// through paneFormat. Absent on sessions launched outside coop,
+	// which fall back to the title heuristics.
+	ClaudeStatusMarker  = "@coop_claude_status" // "busy" | "waiting" | "idle"
+	ClaudeSinceMarker   = "@coop_status_since"  // unix seconds it entered Status
+	ClaudeSessionMarker = "@coop_session_id"    // names the transcript file
+	ClaudeCWDMarker     = "@coop_claude_cwd"    // claude's cwd — the project slug
 )
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterSeenMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterSeenMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
 
 // escapedSep is what tmux ≤ 3.4 prints instead of the \x1f separator:
 // those versions run -F output through vis(3), so every non-printable
@@ -179,11 +189,11 @@ func parsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		f := splitFields(line)
-		if len(f) != 19 {
+		if len(f) != 23 {
 			continue
 		}
-		pid, _ := strconv.Atoi(f[2]) // unreadable pid = 0 = no state lookup
-		panes = append(panes, Pane{
+		pid, _ := strconv.Atoi(f[2]) // unreadable pid just reads as 0 — nothing joins on it
+		p := Pane{
 			Session: f[0], ID: f[1], PID: pid, Title: f[3],
 			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
 			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
@@ -191,7 +201,12 @@ func parsePanes(out string) []Pane {
 			Arbiter:      f[12] == "1", ArbiterMode: f[13], ArbiterSeen: f[14] == "1",
 			ArbiterNudgedMark: f[15] == "1", ArbiterNote: f[16],
 			ArbiterSuggest: f[17], ArbiterLast: f[18],
-		})
+		}
+		if f[19] != "" {
+			p.Claude = &ClaudeState{Status: f[19], StatusSince: unixTime(f[20]),
+				SessionID: f[21], CWD: f[22]}
+		}
+		panes = append(panes, p)
 	}
 	return panes
 }
@@ -370,6 +385,13 @@ func (t *ExecTmux) SetPaneOption(pane, name, value string) error {
 func (t *ExecTmux) UnsetPaneOption(pane, name string) error {
 	_, err := t.run("set-option", "-pu", "-t", pane, name)
 	return err
+}
+
+// PaneOption reads one pane user option; -q makes an unset option an
+// empty string rather than an error.
+func (t *ExecTmux) PaneOption(pane, name string) (string, error) {
+	out, err := t.run("show-options", "-pqv", "-t", pane, name)
+	return strings.TrimSpace(out), err
 }
 
 // SetSessionOption sets a session option — used to mark a hub's own

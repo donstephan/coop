@@ -3,8 +3,6 @@ package tui
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -144,6 +142,9 @@ func (f *fakeTmux) UnsetPaneOption(pane, name string) error {
 	delete(f.paneOpts, pane+"/"+name)
 	return nil
 }
+func (f *fakeTmux) PaneOption(pane, name string) (string, error) {
+	return f.paneOpts[pane+"/"+name], f.err
+}
 func (f *fakeTmux) SetSessionOption(session, name, value string) error {
 	if f.err != nil {
 		return f.err
@@ -267,37 +268,26 @@ func (m Model) pollMsgNow(t *testing.T) tea.Msg {
 	return m.poll()()
 }
 
-// Claude Code publishes its status per pid; the poll joins on pane_pid
-// and that beats the pane title (idle-looking here, actually busy).
+// Claude Code's hooks publish status onto the pane's own tmux options,
+// parsed into Pane.Claude by parsePanes; that beats the pane title
+// (idle-looking here, actually busy).
 func TestPollUsesClaudeState(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "4242.json"),
-		[]byte(`{"sessionId":"abc","name":"coop-fd","status":"busy"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	f := &fakeTmux{panes: []hub.Pane{
-		{Session: "coop", ID: "%1", PID: 4242, Title: "✻ coop", Cmd: "claude"},
+		{Session: "coop", ID: "%1", PID: 4242, Title: "✻ coop", Cmd: "claude",
+			Claude: &hub.ClaudeState{SessionID: "abc", Status: "busy"}},
 		{Session: "other", ID: "%2", PID: 99, Title: "⠂ working", Cmd: "claude"},
 	}}
 	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	m.claude = &hub.ClaudeSessions{Dir: dir}
 	m = drive(t, m, m.poll())
 	if m.panes[0].Status != hub.StatusWorking {
 		t.Errorf("pane with published state: Status = %v, want working", m.panes[0].Status)
 	}
-	if m.panes[0].Claude == nil || m.panes[0].Claude.Name != "coop-fd" {
+	if m.panes[0].Claude == nil || m.panes[0].Claude.SessionID != "abc" {
 		t.Errorf("pane should carry its published state, got %+v", m.panes[0].Claude)
 	}
-	// No file for pid 99: that pane still reads its title.
+	// No published state for pid 99: that pane still reads its title.
 	if m.panes[1].Status != hub.StatusWorking || m.panes[1].Claude != nil {
 		t.Errorf("pane without published state: %v %+v", m.panes[1].Status, m.panes[1].Claude)
-	}
-}
-
-func TestNewReadsDefaultClaudeSessions(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	if m.claude == nil {
-		t.Fatal("New should wire up the default ~/.claude/sessions reader")
 	}
 }
 
@@ -398,7 +388,7 @@ func TestLiveTitleUsesStatusAge(t *testing.T) {
 		ID: "%1", Title: "✻ alpha", Created: time.Now().Add(-3 * time.Hour),
 		Claude: &hub.ClaudeState{Status: "busy", StatusSince: time.Now().Add(-4 * time.Minute)},
 	}}
-	hub.DeriveStatuses(panes, nil)
+	hub.DeriveStatuses(panes)
 	if got := liveTitleFor(panes, "%1"); got != "working · 4m · alpha" {
 		t.Errorf("liveTitleFor = %q, want %q", got, "working · 4m · alpha")
 	}
@@ -557,8 +547,8 @@ func TestStatColumnResizesNav(t *testing.T) {
 // column nobody is looking at.
 func TestPollSkipsTranscriptsWhenColumnOff(t *testing.T) {
 	// A transcript is found via the session id in the pane's published
-	// state, so the pane needs one. PID 0 means AttachClaudeState skips
-	// the pane and leaves the state the fake supplied.
+	// state, so the pane needs one — set directly here since parsePanes
+	// isn't in play against a fakeTmux.
 	panes := testPanes()
 	panes[1].Claude = &hub.ClaudeState{SessionID: "abc", Status: "idle"}
 	f := &fakeTmux{panes: panes}
@@ -1171,25 +1161,6 @@ func TestActionErrorSurvivesPollAndClearsOnKeypress(t *testing.T) {
 	}
 }
 
-const dialogScreen = `Do you want to proceed?
-❯ 1. Yes
-  2. No, and tell Claude what to do differently (esc)`
-
-func TestScreenDialogTurnsIdleIntoNeedsInput(t *testing.T) {
-	f := &fakeTmux{panes: testPanes(), screen: dialogScreen}
-	m := pollOnce(t, f)
-	i := m.indexOf("%1") // alpha: idle title, dialog on screen
-	if i < 0 {
-		t.Fatal("alpha missing")
-	}
-	if m.panes[i].Status != hub.StatusNeedsInput {
-		t.Fatalf("alpha with on-screen dialog should be needs-input, got %v", m.panes[i].Status)
-	}
-	if !strings.Contains(m.View(), "◆  Claude Code") {
-		t.Error("view should render alpha's derived needs-input glyph")
-	}
-}
-
 func TestDigitAnswersNeedsInputSession(t *testing.T) {
 	f := &fakeTmux{panes: testPanes(), cmd: "claude"}
 	m := pollOnce(t, f)                                // alpha selected
@@ -1440,6 +1411,37 @@ func TestQuitArmsWithFooterPrompt(t *testing.T) {
 	}
 	if v := m.View(); !strings.Contains(v, "quit coop?") {
 		t.Fatalf("footer should prompt for confirmation:\n%s", v)
+	}
+}
+
+// A prompt too wide for navWidth flows onto a second row instead of being
+// clipped — a confirm whose "esc cancel" is cut off hides the way out.
+func TestConfirmPromptFlowsInsteadOfClipping(t *testing.T) {
+	got := viewConfirm(navWidth-4, "quit coop?", "y quit", "k kill all & quit", "esc cancel")
+	for _, want := range []string{"quit coop?", "y quit", "k kill all & quit", "esc cancel"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prompt %q missing %q", got, want)
+		}
+	}
+	if lines := strings.Split(got, "\n"); len(lines) < 2 {
+		t.Errorf("prompt should wrap at navWidth, got one line: %q", got)
+	} else {
+		for _, l := range lines {
+			if w := lipgloss.Width(l); w > navWidth-4 {
+				t.Errorf("line %q is %d wide, over the %d inner width", l, w, navWidth-4)
+			}
+		}
+	}
+}
+
+// A session name longer than the pane is hard-broken, not left to overhang
+// into frame()'s clip.
+func TestConfirmPromptBreaksLongName(t *testing.T) {
+	got := viewConfirm(20, "kill "+strings.Repeat("z", 40)+"?", "y confirm", "esc cancel")
+	for _, l := range strings.Split(got, "\n") {
+		if w := lipgloss.Width(l); w > 20 {
+			t.Errorf("line %q is %d wide, want ≤ 20", l, w)
+		}
 	}
 }
 

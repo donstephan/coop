@@ -29,8 +29,10 @@ func TestStatusFor(t *testing.T) {
 	}
 }
 
-// Claude Code publishes its own status per process (see ClaudeSessions),
-// which beats every heuristic StatusFor otherwise applies to the title.
+// The injected hooks publish a status onto the pane (see hook.go),
+// which beats every heuristic StatusFor otherwise applies to the title —
+// except the title cross-checks covered by TestStatusForHookCrossChecks
+// (busy + bell, waiting + spinner), which prove the published state stale.
 func TestStatusForPrefersClaudeState(t *testing.T) {
 	cases := []struct {
 		name string
@@ -41,8 +43,8 @@ func TestStatusForPrefersClaudeState(t *testing.T) {
 			Pane{Title: "✻ coop", Claude: &ClaudeState{Status: "busy"}}, StatusWorking},
 		{"idle beats spinner title",
 			Pane{Title: "⠂ working", Claude: &ClaudeState{Status: "idle"}}, StatusIdle},
-		{"busy beats a latched bell",
-			Pane{Title: "✻ coop", Bell: true, Claude: &ClaudeState{Status: "busy"}}, StatusWorking},
+		{"idle beats a latched bell",
+			Pane{Title: "✻ coop", Bell: true, Claude: &ClaudeState{Status: "idle"}}, StatusIdle},
 		{"waiting without any bell",
 			Pane{Title: "✻ coop", Claude: &ClaudeState{Status: "waiting"}}, StatusNeedsInput},
 		{"unrecognized status falls back to the title",
@@ -52,6 +54,34 @@ func TestStatusForPrefersClaudeState(t *testing.T) {
 		if got := StatusFor(c.pane); got != c.want {
 			t.Errorf("%s: StatusFor = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestStatusForHookCrossChecks(t *testing.T) {
+	cases := []struct {
+		name string
+		pane Pane
+		want Status
+	}{
+		{"hook wins over stale bell", Pane{Bell: true,
+			Claude: &ClaudeState{Status: "idle"}}, StatusIdle},
+		{"waiting + spinner = approved long tool", Pane{Title: "⠇ npm test",
+			Claude: &ClaudeState{Status: "waiting"}}, StatusWorking},
+		{"busy + bell = rang since", Pane{Bell: true,
+			Claude: &ClaudeState{Status: "busy"}}, StatusNeedsInput},
+		{"busy + bell emoji", Pane{Title: "🔔 pick one",
+			Claude: &ClaudeState{Status: "busy"}}, StatusNeedsInput},
+		{"waiting, no spinner", Pane{Title: "✳ Claude Code",
+			Claude: &ClaudeState{Status: "waiting"}}, StatusNeedsInput},
+		{"unrecognized status falls to title", Pane{Title: "⠇ working",
+			Claude: &ClaudeState{Status: "pondering"}}, StatusWorking},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := StatusFor(tc.pane); got != tc.want {
+				t.Errorf("StatusFor = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -73,7 +103,7 @@ func TestSortPanesGroupsByRepo(t *testing.T) {
 		{Session: "alpha-2", Path: "/r/alpha", Title: "⠂ compiling"},
 		{Session: "beta-2", Path: "/r/beta", Bell: true, Title: "✻ b2"},
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	SortPanes(panes)
 	want := []string{"alpha", "alpha-2", "beta", "beta-2"}
 	for i := range want {
@@ -92,7 +122,7 @@ func TestSortPanesNeedsInputDoesNotHoist(t *testing.T) {
 		{Session: "z1", Path: "/r/zeta", Title: "🔔 pick an option"},
 		{Session: "z2", Path: "/r/zeta", Title: "✳ Claude Code"},
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	SortPanes(panes)
 	want := []string{"a1", "m1", "z1", "z2"}
 	for i := range want {
@@ -108,7 +138,7 @@ func TestSortPanesGroupsAlphabetical(t *testing.T) {
 		{Session: "z", Path: "/r/zeta", Title: "✳ Claude Code"},
 		{Session: "a", Path: "/r/alpha", Title: "✳ Claude Code"},
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	SortPanes(panes)
 	if panes[0].Session != "a" || panes[1].Session != "z" {
 		t.Fatalf("groups should sort alphabetically, got %v", sessions(panes))
@@ -124,7 +154,7 @@ func TestSortPanesArbiterLast(t *testing.T) {
 		{Session: "arbiter", Path: "/r/arbiter", Arbiter: true, Title: "✳ Claude Code"},
 		{Session: "alpha", Path: "/r/alpha", Title: "✳ Claude Code"},
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	SortPanes(panes)
 	want := []string{"alpha", "zeta", "arbiter"}
 	for i := range want {
@@ -161,7 +191,7 @@ func TestSortPanesStableWithinGroup(t *testing.T) {
 		{Session: "d-idle", Title: "✻ d"},
 		{Session: "e-bell", Title: "🔔 pick an option"},
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	SortPanes(panes)
 	want := []string{"a-idle", "b-work", "c-bell", "d-idle", "e-bell"}
 	for i := range want {
@@ -225,62 +255,14 @@ func TestNeedsInputScreenIgnoresScrollback(t *testing.T) {
 	}
 }
 
-func TestDeriveStatuses(t *testing.T) {
-	panes := []Pane{
-		{ID: "%1", Title: "✳ Claude Code"},       // idle, screen says dialog
-		{ID: "%2", Title: "⠂ compiling"},         // working — screen not consulted
-		{ID: "%3", Title: "✻ other", Bell: true}, // bell wins without capture
-		{ID: "%4", Title: "✳ plain"},             // idle, screen idle
-	}
-	captured := map[string]string{"%1": screenPermissionDialog, "%4": screenIdle}
-	var asked []string
-	capture := func(pane string) (string, error) {
-		asked = append(asked, pane)
-		return captured[pane], nil
-	}
-	DeriveStatuses(panes, capture)
-	want := []Status{StatusNeedsInput, StatusWorking, StatusNeedsInput, StatusIdle}
-	for i, w := range want {
-		if panes[i].Status != w {
-			t.Errorf("pane %s: Status = %v, want %v", panes[i].ID, panes[i].Status, w)
-		}
-	}
-	for _, id := range asked {
-		if id == "%2" || id == "%3" {
-			t.Errorf("captured %s, but non-idle panes must not be captured", id)
-		}
-	}
-}
-
-// First-party state is authoritative, so the screen-capture fallback —
-// the expensive part of a poll — is pure waste for those panes.
-func TestDeriveStatusesSkipsCaptureWithClaudeState(t *testing.T) {
-	panes := []Pane{
-		{ID: "%1", Title: "✳ Claude Code", Claude: &ClaudeState{Status: "idle"}},
-		{ID: "%2", Title: "✳ Claude Code"},
-	}
-	var asked []string
-	capture := func(pane string) (string, error) {
-		asked = append(asked, pane)
-		return screenPermissionDialog, nil
-	}
-	DeriveStatuses(panes, capture)
-	if len(asked) != 1 || asked[0] != "%2" {
-		t.Fatalf("only the pane without published state should be captured, got %v", asked)
-	}
-	if panes[0].Status != StatusIdle {
-		t.Errorf("pane %%1 = %v, want idle from its published state", panes[0].Status)
-	}
-	if panes[1].Status != StatusNeedsInput {
-		t.Errorf("pane %%2 = %v, want needs-input from its screen", panes[1].Status)
-	}
-}
-
-func TestDeriveStatusesNilCapture(t *testing.T) {
+// Panes with no hook-published Claude state (nothing in p.Claude) fall
+// back to the title heuristics entirely — this is that fallback's only
+// input, so DeriveStatuses must still produce a status from it alone.
+func TestDeriveStatusesTitleFallback(t *testing.T) {
 	panes := []Pane{{ID: "%1", Title: "✳ x"}, {ID: "%2", Title: "⠂ y"}}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	if panes[0].Status != StatusIdle || panes[1].Status != StatusWorking {
-		t.Fatalf("nil capture should still derive title statuses, got %v %v",
+		t.Fatalf("title-only panes should still derive a status, got %v %v",
 			panes[0].Status, panes[1].Status)
 	}
 }

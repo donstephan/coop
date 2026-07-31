@@ -419,15 +419,65 @@ func TestArbiterSuggestOf(t *testing.T) {
 
 func TestPeek(t *testing.T) {
 	f := &fakeTmux{panes: arbiterPanes(), screen: "\x1b[1mDo it?\x1b[0m\n❯ 1. Yes\n"}
-	out, err := Peek(f, &Transcripts{}, nil, "alpha")
+	out, err := Peek(f, &Transcripts{}, "alpha")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "Do it?") || strings.Contains(out, "\x1b[") {
 		t.Errorf("Peek = %q, want stripped screen", out)
 	}
-	if _, err := Peek(f, &Transcripts{}, nil, "ghost"); err == nil {
+	// arbiterPanes' alpha carries no Claude state, so there is nothing to
+	// join a transcript through — the p.Claude branch must stay untaken.
+	if strings.Contains(out, "last assistant message") {
+		t.Error("Peek added a transcript section with no Claude state to key it")
+	}
+	if _, err := Peek(f, &Transcripts{}, "ghost"); err == nil {
 		t.Error("peeked a missing session")
+	}
+}
+
+// A pane whose session published Claude state (the hook path) gets its
+// last transcript turn appended after the screen — the branch TestPeek
+// above can't reach because arbiterPanes' pane has no p.Claude.
+func TestPeekWithClaudeState(t *testing.T) {
+	tr := writeTranscript(t, "/home/user/sprocket-v2", "sess-1",
+		`{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"May I run the migration?"}]}}`)
+	panes := []Pane{
+		{Session: "alpha", ID: "%1",
+			Claude: &ClaudeState{SessionID: "sess-1", CWD: "/home/user/sprocket-v2"}},
+		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"},
+	}
+	f := &fakeTmux{panes: panes, screen: "screen text\n"}
+	out, err := Peek(f, tr, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "screen text") {
+		t.Errorf("Peek = %q, want the screen section", out)
+	}
+	if !strings.Contains(out, "=== last assistant message ===\nMay I run the migration?") {
+		t.Errorf("Peek = %q, want the transcript's last text turn", out)
+	}
+}
+
+// Claude state with no matching transcript file (not flushed yet, or the
+// session predates the hooks) must still return the screen — LastText's
+// false is swallowed silently, never surfaced as an error.
+func TestPeekClaudeStateNoTranscript(t *testing.T) {
+	panes := []Pane{
+		{Session: "alpha", ID: "%1",
+			Claude: &ClaudeState{SessionID: "missing", CWD: "/home/user/sprocket-v2"}},
+	}
+	f := &fakeTmux{panes: panes, screen: "screen text\n"}
+	out, err := Peek(f, &Transcripts{Dir: t.TempDir()}, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "screen text") {
+		t.Errorf("Peek = %q, want the screen section", out)
+	}
+	if strings.Contains(out, "last assistant message") {
+		t.Errorf("Peek = %q, want no transcript section for a missing file", out)
 	}
 }
 

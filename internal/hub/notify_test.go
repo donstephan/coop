@@ -19,7 +19,7 @@ func notifyRound(t *NotifyTracker, f *fakeTmux, titles map[string]string) []stri
 			NotifiedMark: f.paneOpts[id+"/"+NotifiedMarker] == "1",
 		})
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	var got []string
 	for _, p := range t.Apply(panes) {
 		got = append(got, p.Session)

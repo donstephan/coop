@@ -30,24 +30,44 @@ func (s Status) String() string {
 	}
 }
 
-// StatusFor derives a pane's status from its title and bell flag.
-// Rules from live observation (2026-07-23): Claude Code titles a working
-// session with a braille spinner frame ("⠂ Simplify tmux session…"), rings
-// the bell / adds 🔔 when it needs input, and otherwise shows "✳ Claude
-// Code" or "✻ <name>".
-// Claude Code also publishes its own status per process (ClaudeSessions)
-// and that beats every heuristic here — including a bell flag tmux
-// latched during an earlier needs-input episode.
+// hasBell reports the needs-input title signals: tmux's latched bell
+// flag or the 🔔 Claude Code puts in the title.
+func hasBell(p Pane) bool {
+	return p.Bell || strings.Contains(p.Title, "🔔")
+}
+
+// titleSpinner reports a braille spinner frame leading the title —
+// Claude Code's "working" marker.
+func titleSpinner(title string) bool {
+	r, _ := utf8.DecodeRuneInString(title)
+	return r >= 0x2800 && r <= 0x28FF
+}
+
+// StatusFor derives a pane's status. The hook-published state (Claude,
+// from the pane's @coop_claude_status options — see hook.go) beats the
+// title heuristics, except where the title proves it stale: no hook
+// event fires between approving a tool run and its PostToolUse, so
+// waiting + spinner means the dialog was answered; and nothing fires on
+// an esc-interrupt, so busy + bell means Claude rang for input since.
+// Panes publishing nothing (launched outside coop) read from the title
+// alone — rules from live observation (2026-07-23): braille spinner =
+// working, bell/🔔 = needs input, otherwise idle.
 func StatusFor(p Pane) Status {
 	if p.Claude != nil {
 		if st, ok := p.Claude.status(); ok {
+			if st == StatusNeedsInput && titleSpinner(p.Title) {
+				return StatusWorking
+			}
+			if st == StatusWorking && hasBell(p) {
+				return StatusNeedsInput
+			}
 			return st
 		}
 	}
-	if p.Bell || strings.Contains(p.Title, "🔔") {
+	if hasBell(p) {
 		return StatusNeedsInput
 	}
-	if r, _ := utf8.DecodeRuneInString(p.Title); r >= 0x2800 && r <= 0x28FF {
+	if titleSpinner(p.Title) {
 		return StatusWorking
 	}
 	return StatusIdle
@@ -71,8 +91,10 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x
 
 // NeedsInputScreen reports whether a pane's visible tail shows an open
 // Claude Code dialog (permission prompt, question menu, trust prompt).
-// Needed because attached sessions never latch tmux's bell flag and the
-// pane title doesn't distinguish an open dialog from idle.
+// Serves the arbiter's answer gate (Answer) — attached sessions never
+// latch tmux's bell flag and the pane title doesn't distinguish an open
+// dialog from idle, so the arbiter checks the actual screen before it
+// types a reply.
 func NeedsInputScreen(screen string) bool {
 	screen = ansiRe.ReplaceAllString(screen, "")
 	screen = strings.ReplaceAll(screen, " ", " ") // Claude pads the caret with NBSP
@@ -89,22 +111,11 @@ func NeedsInputScreen(screen string) bool {
 	return dialogOption.MatchString(tail) || strings.Contains(tail, "Enter to select")
 }
 
-// DeriveStatuses fills each pane's Status. Title and bell flag decide
-// working/needs-input; panes that look idle get their screen captured
-// (when capture is non-nil) to catch open dialogs the title can't show.
-// Capture errors leave the pane idle — it likely just died and the next
-// poll will drop it.
-func DeriveStatuses(panes []Pane, capture func(pane string) (string, error)) {
+// DeriveStatuses fills each pane's Status — derived fresh every poll,
+// never stored.
+func DeriveStatuses(panes []Pane) {
 	for i := range panes {
-		st := StatusFor(panes[i])
-		// The capture exists to catch dialogs the title can't show; a
-		// pane publishing its own status has already told us.
-		if st == StatusIdle && capture != nil && !panes[i].claudeStatusKnown() {
-			if screen, err := capture(panes[i].ID); err == nil && NeedsInputScreen(screen) {
-				st = StatusNeedsInput
-			}
-		}
-		panes[i].Status = st
+		panes[i].Status = StatusFor(panes[i])
 	}
 }
 

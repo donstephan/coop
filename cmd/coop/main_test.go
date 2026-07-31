@@ -21,7 +21,7 @@ func indexOfSubslice(haystack, needle []string) int {
 
 func TestCreateArgvChainsDefaults(t *testing.T) {
 	got := createArgv("/bin/self", "cc", "claude,node", "/cfg.json", "claude",
-		"5m", nil, "roost-2")
+		"5m", true, nil, "roost-2")
 
 	// -f /dev/null keeps the user's personal tmux.conf off the hub server.
 	prefix := []string{"tmux", "-L", "cc", "-f", os.DevNull, "start-server"}
@@ -32,6 +32,7 @@ func TestCreateArgvChainsDefaults(t *testing.T) {
 	suffix := []string{";", "new-session", "-d", "-s", "roost-2",
 		"/bin/self", "-socket", "cc", "-allowed-cmds", "claude,node",
 		"-config", "/cfg.json", "-claude-cmd", "claude", "-done-ttl", "5m",
+		"-hooks=true",
 		";", "set-option", "-t", "roost-2:", "@coop", "1"}
 	if i := indexOfSubslice(got, suffix); i == -1 || i+len(suffix) != len(got) {
 		t.Fatalf("argv = %v, want suffix %v", got, suffix)
@@ -51,7 +52,7 @@ func TestCreateArgvChainsDefaults(t *testing.T) {
 
 func TestCreateArgvAppendsOverridesLast(t *testing.T) {
 	got := createArgv("/bin/self", "cc", "claude,node", "/cfg.json", "claude",
-		"5m", [][]string{{"set", "-g", "mouse", "off"}}, "roost")
+		"5m", false, [][]string{{"set", "-g", "mouse", "off"}}, "roost")
 
 	// Overrides come after every default (so they win), right before
 	// new-session.

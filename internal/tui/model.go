@@ -66,7 +66,6 @@ type Model struct {
 	done       *hub.DoneTracker
 	notify     *hub.NotifyTracker
 	nudge      *hub.ArbiterNudger
-	claude     *hub.ClaudeSessions // Claude Code's own per-process state
 	// transcripts reads session transcripts for the stat column; a field
 	// rather than a concrete type so tests can substitute one.
 	transcripts func(sessionID, cwd string) (hub.TranscriptStats, bool)
@@ -129,7 +128,6 @@ func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
 		loadRepos: loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
 		notify: hub.NewNotifyTracker(tm), nudge: hub.NewArbiterNudger(tm, hubSession),
-		claude:      hub.DefaultClaudeSessions(),
 		transcripts: hub.DefaultTranscripts().Stats,
 		arb:         arb,
 		focused:     true, width: 80, height: 24}
@@ -155,7 +153,7 @@ func (m Model) poll() tea.Cmd {
 	tm, hubSession, live := m.tmux, m.hubSession, m.livePane
 	done, notify, liveTarget := m.done, m.notify, m.liveTarget
 	nudge := m.nudge
-	claude, transcripts := m.claude, m.transcripts
+	transcripts := m.transcripts
 	if m.statCol == statColOff {
 		transcripts = nil // nobody is looking; don't touch the filesystem
 	}
@@ -176,9 +174,8 @@ func (m Model) poll() tea.Cmd {
 				hubs = append(hubs, p.Session)
 			}
 		}
-		hub.AttachClaudeState(panes, claude.Lookup)
 		hub.AttachTranscriptStats(panes, transcripts)
-		hub.DeriveStatuses(panes, tm.CapturePane)
+		hub.DeriveStatuses(panes)
 		for _, p := range notify.Apply(panes) {
 			hub.NotifySend(p.Session, cleanTitle(p.Title))
 		}
@@ -1631,21 +1628,22 @@ func (m Model) viewPicker(avail int) string {
 }
 
 func (m Model) viewFooter() string {
+	inner := m.width - 4 // frame() draws "│ " and " │"
 	if m.confirmQuit {
-		return errStyle.Render("quit coop? · y quit · k kill all & quit · esc cancel")
+		return viewConfirm(inner, "quit coop?", "y quit", "k kill all & quit", "esc cancel")
 	}
 	if m.confirmKillAll > 0 {
 		word := "sessions"
 		if m.confirmKillAll == 1 {
 			word = "session"
 		}
-		return errStyle.Render(fmt.Sprintf("%d %s still working — kill all & quit? · y confirm · esc cancel",
-			m.confirmKillAll, word))
+		return viewConfirm(inner,
+			fmt.Sprintf("%d %s still working — kill all & quit?", m.confirmKillAll, word),
+			"y confirm", "esc cancel")
 	}
 	if m.confirmKill != "" {
-		return errStyle.Render("kill " + m.confirmKill + "? · y confirm · esc cancel")
+		return viewConfirm(inner, "kill "+m.confirmKill+"?", "y confirm", "esc cancel")
 	}
-	inner := m.width - 4 // frame() draws "│ " and " │"
 	box, overflow := m.viewMsgBox(inner)
 
 	hints := []string{"↑/↓ select", "enter focus", "n new", m.arbiterHint(), "? help"}
@@ -1670,6 +1668,25 @@ func (m Model) viewFooter() string {
 		foot = box + "\n\n" + foot // blank row sets the message off the hints
 	}
 	return foot
+}
+
+// viewConfirm renders a confirm prompt — the question, then the keys that
+// answer it — flowed across as many footer rows as it takes. A prompt owns
+// the footer and is the only way out of the armed state, so unlike the
+// message box it is never windowed: clipping "esc cancel" at navWidth hides
+// the way out.
+func viewConfirm(width int, question string, keys ...string) string {
+	parts := append([]string{question}, keys...)
+	if width < 1 {
+		return errStyle.Render(strings.Join(parts, " · ")) // width not known yet
+	}
+	var lines []string
+	for _, l := range flowItems(parts, width) {
+		// A question longer than width (a long session name) still
+		// overhangs the flow; hard-break whatever frame() would clip.
+		lines = append(lines, strings.Split(wrap.String(l, width), "\n")...)
+	}
+	return styleLines(lines, errStyle)
 }
 
 // viewMsgBox renders the message wrapped to width, windowed to the visible
@@ -1775,6 +1792,12 @@ func (m Model) arbiterDetail() (string, lipgloss.Style) {
 // flowHints packs hint items into "·"-separated lines that fit width, so
 // the frame never clips a hint mid-word on narrow panes.
 func flowHints(items []string, width int) string {
+	return styleLines(flowItems(items, width), footStyle)
+}
+
+// flowItems is flowHints' packing, unstyled so callers can wrap the
+// result before rendering — styled text can't be measured or broken.
+func flowItems(items []string, width int) []string {
 	var lines []string
 	line := ""
 	for _, it := range items {
@@ -1784,10 +1807,17 @@ func flowHints(items []string, width int) string {
 		case lipgloss.Width(line)+3+lipgloss.Width(it) <= width:
 			line += " · " + it
 		default:
-			lines = append(lines, footStyle.Render(line))
+			lines = append(lines, line)
 			line = it
 		}
 	}
-	lines = append(lines, footStyle.Render(line))
-	return strings.Join(lines, "\n")
+	return append(lines, line)
+}
+
+func styleLines(lines []string, style lipgloss.Style) string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = style.Render(l)
+	}
+	return strings.Join(out, "\n")
 }

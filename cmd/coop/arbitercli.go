@@ -78,8 +78,7 @@ func runArbiterCLI(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		var out string
-		if out, err = hub.Peek(tm, hub.DefaultTranscripts(),
-			hub.DefaultClaudeSessions(), pos[0]); err == nil {
+		if out, err = hub.Peek(tm, hub.DefaultTranscripts(), pos[0]); err == nil {
 			fmt.Fprint(stdout, out)
 		}
 	case "answer":

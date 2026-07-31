@@ -21,7 +21,7 @@ func applyRound(t *DoneTracker, f *fakeTmux, titles map[string]string,
 			DoneSince:   unixTime(f.paneOpts[id+"/"+DoneSinceMarker]),
 		})
 	}
-	DeriveStatuses(panes, nil)
+	DeriveStatuses(panes)
 	t.Apply(panes, visited, now)
 	got := map[string]Status{}
 	for _, p := range panes {
