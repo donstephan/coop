@@ -2,10 +2,13 @@ package main
 
 import "testing"
 
-func TestIsArbiterCmd(t *testing.T) {
-	for _, args := range [][]string{{"peek", "alpha"}, {"answer"}, {"note", "a", "b"}} {
-		if !isArbiterCmd(args) {
-			t.Errorf("isArbiterCmd(%v) = false", args)
+func TestIsArbiterCmdOnlyPeek(t *testing.T) {
+	if !isArbiterCmd([]string{"peek", "alpha"}) {
+		t.Error("peek should still dispatch")
+	}
+	for _, verb := range []string{"answer", "note"} {
+		if isArbiterCmd([]string{verb, "alpha"}) {
+			t.Errorf("%s is an internal call now, not a CLI verb", verb)
 		}
 	}
 	for _, args := range [][]string{{}, {"-socket", "x"}, {"help"}} {

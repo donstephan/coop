@@ -25,19 +25,18 @@ import (
 type tickMsg time.Time
 
 type pollMsg struct {
-	panes    []hub.Pane
-	hubs     []string // sessions marked @coop — every hub instance's own
-	liveGone bool
-	title    string // live pane title set during the poll; "" if none
-	caughtUp bool   // the arbiter launch catch-up ran this poll
-	err      error
+	panes       []hub.Pane
+	hubs        []string // sessions marked @coop — every hub instance's own
+	liveGone    bool
+	title       string // live pane title set during the poll; "" if none
+	arbiterMode string // socket-global arbiter mode read this poll
+	err         error
 }
 
 type focusedMsg struct{ err error }
 type sentMsg struct{ err error }
 type createdMsg struct {
-	err     error
-	arbiter bool // true when this createdMsg came from arbiterCreateCmd
+	err error
 }
 type killedMsg struct{ err error }
 
@@ -111,30 +110,23 @@ type Model struct {
 	// addRepo writes a repo into the config and returns the directory it
 	// resolved to; nil when there is no config to write.
 	addRepo func(repo string) (string, error)
-	arb     ArbiterConfig
-	// arbiterCatchup: a just-launched arbiter owes already-waiting panes a one-shot catch-up nudge
-	arbiterCatchup bool
+	// arbiterMode: the socket-global arbiter mode, refreshed from every
+	// poll; hub.ArbiterModeOff until the first one lands.
+	arbiterMode string
 
 	width, height int
-}
-
-// ArbiterConfig is what the a key needs to launch the arbiter session.
-// The zero value disables launching (a reports the missing config).
-type ArbiterConfig struct {
-	Model     string // claude model id/alias; "" means sonnet
-	ConfigDir string // dir holding arbiter.md and the arbiter/ workdir
 }
 
 func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
 	claudeCmd string, loadRepos func() ([]string, error),
 	addRepo func(string) (string, error),
-	doneTTL time.Duration, arb ArbiterConfig) Model {
+	doneTTL time.Duration) Model {
 	return Model{tmux: tm, allowed: allowed, hubSession: hubSession,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
 		loadRepos: loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
 		notify:      hub.NewNotifyTracker(tm),
 		transcripts: hub.DefaultTranscripts().Stats,
-		arb:         arb,
+		arbiterMode: hub.ArbiterModeOff,
 		focused:     true, width: 80, height: 24}
 }
 
@@ -157,7 +149,6 @@ func tick() tea.Cmd {
 func (m Model) poll() tea.Cmd {
 	tm, hubSession, live := m.tmux, m.hubSession, m.livePane
 	done, notify, liveTarget := m.done, m.notify, m.liveTarget
-	catchup := m.arbiterCatchup
 	transcripts := m.transcripts
 	if m.statCol == statColOff {
 		transcripts = nil // nobody is looking; don't touch the filesystem
@@ -188,18 +179,10 @@ func (m Model) poll() tea.Cmd {
 		// to clear them itself (hand-started sessions, -hooks=false) —
 		// needs derived statuses, so it runs here rather than in Update.
 		hub.RetireStaleEpisodes(tm, panes)
-		caughtUp := false
-		if catchup {
-			// The launch catch-up runs here in the poll closure — same
-			// place the old nudger lived — because the pollMsg handler's
-			// single command is already spoken for (retarget). Gated on
-			// the same readiness age as HookNudge; until the arbiter is
-			// old enough the flag just rides to the next tick.
-			if arb, ok := hub.FindArbiter(panes); ok && hub.ArbiterReady(arb, time.Now()) {
-				hub.CatchupNudge(tm, panes, arb)
-				caughtUp = true
-			}
-		}
+		// One extra tmux call a second buys the mode without depending on
+		// whether #{@coop_arbiter_mode} resolves globally in a pane
+		// format — it probably does, but not verifiably on tmux 3.4.
+		mode := hub.ArbiterMode(tm)
 		done.Apply(panes, visitedFunc(tm, hubSession, live, liveTarget), time.Now())
 		hub.SortPanes(panes)
 		liveGone := live != "" && !paneExists(all, live)
@@ -211,7 +194,7 @@ func (m Model) poll() tea.Cmd {
 				}
 			}
 		}
-		return pollMsg{panes: panes, hubs: hubs, liveGone: liveGone, title: title, caughtUp: caughtUp}
+		return pollMsg{panes: panes, hubs: hubs, liveGone: liveGone, title: title, arbiterMode: mode}
 	}
 }
 
@@ -449,10 +432,6 @@ func (m Model) resizeSelf() tea.Cmd {
 // so repeated presses cycle through every blocked session — answering
 // one clears its status, which is all the memory the cycle needs. ""
 // means nothing needs input.
-//
-// The arbiter is never a target: tab is for the work that is blocked on
-// you, and an arbiter at its own permission prompt is coop's problem,
-// not a session's. Its pinned row shows the status; arrow to it.
 func nextNeedsInput(panes []hub.Pane, selectedID string) string {
 	start := 0
 	for i, p := range panes {
@@ -462,7 +441,7 @@ func nextNeedsInput(panes []hub.Pane, selectedID string) string {
 		}
 	}
 	for i := range panes {
-		if p := panes[(start+i)%len(panes)]; p.Status == hub.StatusNeedsInput && !p.Arbiter {
+		if p := panes[(start+i)%len(panes)]; p.Status == hub.StatusNeedsInput {
 			return p.ID
 		}
 	}
@@ -535,9 +514,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.title != "" {
 			m.liveTitle = msg.title
 		}
-		if msg.caughtUp {
-			m.arbiterCatchup = false
-		}
+		m.arbiterMode = msg.arbiterMode
 		m.selectedID = pickPane(m.panes, m.selectedID)
 		if m.confirmKill != "" && !m.hasSession(m.confirmKill) {
 			m.confirmKill = "" // armed session died on its own
@@ -642,9 +619,6 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.actionErr = "create: " + msg.err.Error()
 			m.pendingSession = ""
-			if msg.arbiter {
-				m.arbiterCatchup = false // launch failed; nothing to catch up
-			}
 			return m, nil
 		}
 		// Poll now instead of waiting out the tick — the new session
@@ -730,8 +704,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 // paneAt maps a terminal row to the pane rendered there, or "" for any
 // other row. It mirrors the layout frame() and viewNav() draw: border,
 // title line, blank line, then session rows with a header line opening
-// each repo group and a blank line plus divider opening the pinned
-// arbiter section, truncated to leave room for the footer.
+// each repo group, truncated to leave room for the footer.
 func (m Model) paneAt(y int) string {
 	if m.height > 0 {
 		feet := strings.Split(strings.TrimRight(m.viewFooter(), "\n"), "\n")
@@ -742,12 +715,7 @@ func (m Model) paneAt(y int) string {
 	row := y - 3 // border + title line + blank line
 	repo := ""
 	for _, p := range m.panes {
-		if p.Arbiter {
-			if row <= 1 {
-				return "" // blank line, then the arbiter divider
-			}
-			row -= 2
-		} else if r := p.Repo(); r != repo {
+		if r := p.Repo(); r != repo {
 			repo = r
 			if row == 0 {
 				return "" // repo header line
@@ -963,21 +931,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statCol = m.statCol.next()
 		return m, m.resizeSelf()
 	case "a":
-		// Cycle off → recommend → full → off, the s-key precedent. The
-		// session's existence IS the enabled state; mode lives on it.
-		if arb, ok := hub.FindArbiter(m.panes); ok {
-			if hub.ArbiterModeOf(arb) == hub.ArbiterModeRecommend {
-				return m, m.arbiterModeCmd(arb.Session, hub.ArbiterModeFull)
-			}
-			m.confirmKill = arb.Session // full → off: same y/esc confirm as x
-			return m, nil
+		// Cycle off → recommend → full → off, the s-key precedent. Mode
+		// is a socket-global tmux option now, not a session's existence,
+		// so turning it off is a write like any other — no confirm.
+		next := hub.ArbiterModeRecommend
+		switch m.arbiterMode {
+		case hub.ArbiterModeRecommend:
+			next = hub.ArbiterModeFull
+		case hub.ArbiterModeFull:
+			next = hub.ArbiterModeOff
 		}
-		if m.arb.ConfigDir == "" {
-			m.actionErr = "arbiter: no config dir"
-			return m, nil
-		}
-		m.arbiterCatchup = true
-		return m, m.arbiterCreateCmd()
+		m.arbiterMode = next // optimistic; the next poll is authoritative
+		return m, m.arbiterModeCmd(next)
 	case " ":
 		// Apply the arbiter's suggestion: the same send the digit key
 		// makes, minus reading the number out of the note. Not gated on
@@ -1140,31 +1105,12 @@ func (m Model) addRepoCmd(repo string) tea.Cmd {
 	}
 }
 
-// arbiterModeCmd flips the arbiter's mode option. Best-effort: the
-// footer shows the mode from poll data, so a miss self-heals next tick.
-func (m Model) arbiterModeCmd(session, mode string) tea.Cmd {
+// arbiterModeCmd writes the socket-global mode. Best-effort: the footer
+// shows the mode from poll data, so a miss self-heals next tick.
+func (m Model) arbiterModeCmd(mode string) tea.Cmd {
 	tm := m.tmux
 	return func() tea.Msg {
-		return sentMsg{err: tm.SetSessionOption(session, hub.ArbiterModeMarker, mode)}
-	}
-}
-
-// arbiterCreateCmd launches the arbiter session, sized to the live
-// preview like createCmd — same createdMsg path, so a failure lands in
-// actionErr and success triggers an immediate poll.
-func (m Model) arbiterCreateCmd() tea.Cmd {
-	tm, arb, claudeCmd, live := m.tmux, m.arb, m.claudeCmd, m.livePane
-	allowed := strings.Join(m.allowed, ",")
-	return func() tea.Msg {
-		w, h := 0, 0
-		if live != "" {
-			w, h, _ = tm.PaneSize(live)
-		}
-		model := arb.Model
-		if model == "" {
-			model = "sonnet"
-		}
-		return createdMsg{err: hub.LaunchArbiter(tm, arb.ConfigDir, allowed, claudeCmd, model, w, h), arbiter: true}
+		return sentMsg{err: hub.SetArbiterMode(tm, mode)}
 	}
 }
 
@@ -1447,26 +1393,9 @@ func (m Model) View() string {
 		m.focused, m.width, m.height)
 }
 
-// sessionCount is the header's count: the sessions being watched. The
-// arbiter is coop's own machinery — like the hub panes the poll already
-// filters out, it is not something you started and not something to
-// count. Panes, not sessions, as the header has always counted.
+// sessionCount is the header's count: the sessions being watched.
 func (m Model) sessionCount() int {
-	n := len(m.panes)
-	if _, ok := hub.FindArbiter(m.panes); ok {
-		n--
-	}
-	return n
-}
-
-// arbiterDivider is the pinned arbiter section's heading, filled out to
-// the nav's inner width: "─ arbiter ────…".
-func arbiterDivider(w int) string {
-	const head = "─ arbiter "
-	if n := w - lipgloss.Width(head); n > 0 {
-		return head + strings.Repeat("─", n)
-	}
-	return head
+	return len(m.panes)
 }
 
 func (m Model) viewNav() string {
@@ -1479,23 +1408,14 @@ func (m Model) viewNav() string {
 	}
 	repo := ""
 	for _, p := range m.panes {
-		if p.Arbiter {
-			// Pinned last by hub.SortPanes, under its own divider — it is
-			// coop's own infrastructure, not one of the watched repos.
-			b.WriteString("\n" + footStyle.Render(arbiterDivider(m.navCols()-4)) + "\n")
-		} else if r := p.Repo(); r != repo {
+		if r := p.Repo(); r != repo {
 			repo = r
 			b.WriteString(titleStyle.Render(repo) + "\n")
 		}
 		st := statusStyle(p.Status)
 		mark := " "
 		title := cleanTitle(p.Title)
-		if p.Arbiter {
-			// Claude's derived title describes whatever the arbiter last
-			// triaged, which reads as a work session in that repo. Its
-			// mode is the only thing about it worth a row.
-			title = "arbiter · " + hub.ArbiterModeOf(p)
-		} else if p.ArbiterNote != "" {
+		if p.ArbiterNote != "" {
 			mark = "!" // arbiter escalated — detail line has the note
 		}
 		line := pad(st.Render(statusGlyph(p.Status)+mark+" "+
@@ -1780,11 +1700,7 @@ func wrapMsg(text string, width, max, offset int) ([]string, int) {
 // arbiterHint is the a key's footer chip, doubling as the mode display:
 // "a arbiter off|recommend|full".
 func (m Model) arbiterHint() string {
-	arb, ok := hub.FindArbiter(m.panes)
-	if !ok {
-		return "a arbiter off"
-	}
-	return "a arbiter " + hub.ArbiterModeOf(arb)
+	return "a arbiter " + m.arbiterMode
 }
 
 // selectedSuggest is the digit the space key would apply for the

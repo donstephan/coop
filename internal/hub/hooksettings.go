@@ -31,7 +31,7 @@ func DefaultHookSettingsPath() string {
 // sessions, registering coop hook for every event. It overwrites
 // unconditionally: the file is coop infrastructure, regenerated each
 // hub launch so it always names the running binary — deliberately
-// unlike ArbiterHome's seed-once user-owned settings.
+// unlike ArbiterHome's seed-once, user-owned arbiter.md.
 func WriteHookSettings(path, exe string) error {
 	type hookCmd struct {
 		Type    string `json:"type"`
@@ -58,8 +58,8 @@ func WriteHookSettings(path, exe string) error {
 }
 
 // WithHookSettings appends the --settings flag to claudeCmd, which may
-// carry its own flags ("claude --continue") — ours append after, like
-// ArbiterCmd's.
+// carry its own flags ("claude --continue") — ours append after, so the
+// user's command stays intact whatever it already says.
 func WithHookSettings(claudeCmd, path string) string {
 	return claudeCmd + " --settings " + shellQuote(path)
 }

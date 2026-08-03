@@ -20,6 +20,7 @@ type fakeTmux struct {
 	sessionOpts    map[string]string // "session/name" -> value
 	windowOpts     map[string]string // "session/name" -> value
 	serverOpts     map[string]string // name -> value
+	globals        map[string]string // name -> value
 	titles         [][2]string       // {pane, title} per SetPaneTitle call
 	marked         string            // what FindMarkedPane returns
 	created        [][3]string       // {name, dir, cmd}
@@ -144,6 +145,32 @@ func (f *fakeTmux) SetServerOption(name, value string) error {
 	}
 	f.serverOpts[name] = value
 	return nil
+}
+
+func (f *fakeTmux) SetGlobalOption(name, value string) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.globals == nil {
+		f.globals = map[string]string{}
+	}
+	f.globals[name] = value
+	return nil
+}
+
+func (f *fakeTmux) UnsetGlobalOption(name string) error {
+	if f.err != nil {
+		return f.err
+	}
+	delete(f.globals, name)
+	return nil
+}
+
+func (f *fakeTmux) GlobalOption(name string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.globals[name], nil
 }
 
 func (f *fakeTmux) SetPaneTitle(pane, title string) error {

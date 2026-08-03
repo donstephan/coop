@@ -123,16 +123,8 @@ func DeriveStatuses(panes []Pane) {
 // in alphabetical order, rows within a group in tmux's own order
 // (stable). Status never moves a row — a jumpy list is worse than a
 // glance at the status column, and tab jumps to whatever needs input.
-//
-// The arbiter always sorts last, whatever its workdir is named. It is
-// coop's own infrastructure, not work, so it gets a pinned row under
-// the list rather than drifting through the repo groups alphabetically;
-// the nav and paneAt both take "the arbiter is at the bottom" from here.
 func SortPanes(panes []Pane) {
 	sort.SliceStable(panes, func(i, j int) bool {
-		if panes[i].Arbiter != panes[j].Arbiter {
-			return !panes[i].Arbiter
-		}
 		return panes[i].Repo() < panes[j].Repo()
 	})
 }

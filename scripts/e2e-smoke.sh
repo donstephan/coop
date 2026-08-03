@@ -7,6 +7,12 @@ set -euo pipefail
 
 SOCKET="coop-e2e-$$"
 TMPD="$(mktemp -d)"
+# coop's state under the throwaway dir: the server is started below by
+# this shell, so every pane on the socket inherits it. Belt and braces
+# only — nothing this run does should write state at all, and the paths
+# the judge itself uses (claims, audit, judge log) deliberately ignore
+# this variable, since a monitored session can set it. See hub.claimRoot.
+export XDG_STATE_HOME="$TMPD/state"
 cleanup() { tmux -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$TMPD"; }
 trap cleanup EXIT
 
@@ -22,8 +28,7 @@ go build -o /tmp/coop-e2e ./cmd/coop
 # the way a real session's injected hooks would — piping a
 # PermissionRequest payload through the real `coop hook`, which finds
 # the socket in $TMUX and writes @coop_claude_status onto this pane.
-# The dialog text still matters: the answer gate reads it off the
-# screen, and the nested live client renders it.
+# The dialog text still matters: the nested live client renders it.
 # The initial sleep gives us time to enable monitor-bell BEFORE the bell
 # rings (the first new-session is also what starts the throwaway server).
 # Sessions get distinct start dirs: the TUI groups by session_path
@@ -33,21 +38,6 @@ mkdir -p "$TMPD/stub" "$TMPD/zstub"
 tmux -L "$SOCKET" new-session -d -s stub -c "$TMPD/stub" \
   "sleep 3; printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n\a'; printf '{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"stub\",\"cwd\":\"$TMPD/stub\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rm -rf build/\"}}' | /tmp/coop-e2e hook; sleep 300"
 tmux -L "$SOCKET" set -g monitor-bell on
-
-# Fake arbiter: a read-echo loop, so the nudge coop hook types at it
-# lands as a visible GOT: line we can assert on. Created before the
-# stub's hook fires (the stub sleeps first) so the 1s readiness age
-# gate has passed by then.
-# Named "arbiter" (recommend mode) deliberately, not "arb": it coexists
-# with the "arb" session created later for the answer-gate assertions
-# (full mode), and FindArbiter takes the first match in tmux's listing
-# order — "arb" sorts before "arbiter", so the answer test still finds
-# its own full-mode session rather than this recommend-mode one. Do not
-# rename either session without checking that ordering still holds.
-mkdir -p "$TMPD/arb"
-tmux -L "$SOCKET" new-session -d -s arbiter -c "$TMPD/arb" \
-  'while IFS= read -r l; do echo "GOT:$l"; done'
-tmux -L "$SOCKET" set -t arbiter: @coop_arbiter 1
 
 # The hub TUI in its own session on the same socket.
 tmux -L "$SOCKET" new-session -d -s hub -x 100 -y 30 \
@@ -108,10 +98,46 @@ wait_for_title "NEEDS INPUT" "$live"
 wait_for "1. Yes" "$live"      # nested client renders the stub's screen
 echo "ok: discovery, status, live preview"
 
-# The stub's hook invocation must also have nudged the arbiter, with
-# the payload's tool detail in the line.
-wait_for 'mode: recommend; trigger: Bash: rm -rf build/' arbiter
-echo "ok: hook nudged the arbiter with tool detail"
+# The stub's hook fired above with the arbiter mode still unset (the
+# default before anything in this script has touched
+# @coop_arbiter_mode) — spawnJudge must bail out before it claims the
+# episode, or a mode flip later would find that dialog already spent.
+# The judge process itself is the observable, not the claim file: claims
+# live under the password database's home (hub.claimRoot ignores
+# XDG_STATE_HOME on purpose), so this run cannot look at them without
+# reaching into the developer's real home. A spawned judge would be a
+# live `coop-e2e judge` process — and would go on to run a real
+# `claude -p`, which is exactly what must never happen here.
+# The bracket is the ps|grep trick: it matches the same text, but the
+# pattern string itself never appears in a command line, so a shell whose
+# cmdline holds this very line cannot match itself.
+judges="$(pgrep -fc "coop-e2e[ ]judge" || true)"
+[ "${judges:-0}" -eq 0 ] || {
+  echo "FAIL: $judges judge process(es) spawned with the arbiter mode off" >&2; exit 1; }
+echo "ok: no judge spawned while arbiter mode is off"
+
+opt_is() { # opt_is <option> <want>
+  for _ in $(seq 40); do
+    [ "$(tmux -L "$SOCKET" show-options -gqv "$1")" = "$2" ] && return 0
+    sleep 0.25
+  done
+  echo "FAIL: $1 never became '$2' (got '$(tmux -L "$SOCKET" show-options -gqv "$1")')" >&2
+  exit 1
+}
+
+# a cycles the socket-global mode off -> recommend -> full -> off. It is
+# pure tmux state (no hook fires from pressing it), so this is safe to
+# run any time — but it runs last regardless, after every assertion
+# that depends on the stub's one and only hook event, so a stray hook
+# firing during the cycle is never a possibility either.
+mode_is() { opt_is @coop_arbiter_mode "$1"; }
+tmux -L "$SOCKET" send-keys -t "$nav" "a"
+mode_is recommend
+tmux -L "$SOCKET" send-keys -t "$nav" "a"
+mode_is full
+tmux -L "$SOCKET" send-keys -t "$nav" "a"
+mode_is ""
+echo "ok: a cycles arbiter mode off -> recommend -> full -> off"
 
 # A second session; selecting it must retarget the live pane.
 tmux -L "$SOCKET" new-session -d -s zstub -c "$TMPD/zstub" "sleep 300"
@@ -193,30 +219,6 @@ tmux -L "$SOCKET" has-session -t "=addproj" 2>/dev/null \
 grep -q "$TMPD/addproj" "$TMPD/config.json" \
   || { echo "FAIL: repo not written to config: $(cat "$TMPD/config.json")" >&2; exit 1; }
 echo "ok: add repo from picker"
-
-# Arbiter helper CLI. A fake arbiter session (marked, mode full) passes
-# the mode gate, so the refusal under test is the allowed-cmds gate: the
-# stub pane runs sleep, which quick-send must never target.
-tmux -L "$SOCKET" new-session -d -s arb -c "$TMPD" "sleep 300"
-tmux -L "$SOCKET" set-option -t arb: @coop_arbiter 1
-tmux -L "$SOCKET" set-option -t arb: @coop_arbiter_mode full
-# -audit and -allowed-cmds aren't flags (the arbiter's Bash(coop
-# <verb>:*) permissions don't match env-prefixed commands, so the
-# operator's env is the only place these gates can come from).
-# COOP_ALLOWED_CMDS unset here defaults to claude,node, which the
-# sleep pane still fails.
-if out="$(XDG_STATE_HOME="$TMPD/state" /tmp/coop-e2e answer -socket "$SOCKET" stub 1 gate test 2>&1)"; then
-  echo "FAIL: coop answer succeeded against a sleep pane" >&2; exit 1
-fi
-echo "$out" | grep -q "refusing" || { echo "FAIL: unexpected refusal: $out" >&2; exit 1; }
-echo "ok: coop answer refused a non-claude pane"
-
-# With the command allowed, the digit lands and the audit line appears.
-XDG_STATE_HOME="$TMPD/state" COOP_ALLOWED_CMDS=sleep /tmp/coop-e2e answer -socket "$SOCKET" \
-  stub 1 approving stub dialog
-grep -q '"action":"answered"' "$TMPD/state/coop/arbiter-audit.jsonl" \
-  || { echo "FAIL: no audit entry" >&2; exit 1; }
-echo "ok: coop answer sent the digit and audited it"
 
 # Quit (q arms, y confirms) must kill the live pane so the hub session
 # ends with the TUI.

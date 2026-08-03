@@ -56,3 +56,13 @@ func TestDefaultAuditPathXDG(t *testing.T) {
 		t.Errorf("DefaultAuditPath = %q, want %q", got, want)
 	}
 }
+
+// DefaultJudgeLogPath shares stateDir's resolution with DefaultAuditPath
+// — same XDG_STATE_HOME base, different filename alongside it.
+func TestDefaultJudgeLogPathXDG(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/home/user/.local/state")
+	want := filepath.Join("/home/user/.local/state", "coop", "judge.log")
+	if got := DefaultJudgeLogPath(); got != want {
+		t.Errorf("DefaultJudgeLogPath = %q, want %q", got, want)
+	}
+}

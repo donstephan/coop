@@ -145,25 +145,6 @@ func TestSortPanesGroupsAlphabetical(t *testing.T) {
 	}
 }
 
-// The arbiter pins to the bottom whatever its workdir happens to be
-// named — sorted by repo it would land wherever the alphabet put it,
-// drifting as repos come and go.
-func TestSortPanesArbiterLast(t *testing.T) {
-	panes := []Pane{
-		{Session: "zeta", Path: "/r/zeta", Title: "✳ Claude Code"},
-		{Session: "arbiter", Path: "/r/arbiter", Arbiter: true, Title: "✳ Claude Code"},
-		{Session: "alpha", Path: "/r/alpha", Title: "✳ Claude Code"},
-	}
-	DeriveStatuses(panes)
-	SortPanes(panes)
-	want := []string{"alpha", "zeta", "arbiter"}
-	for i := range want {
-		if panes[i].Session != want[i] {
-			t.Fatalf("order %v, want %v", sessions(panes), want)
-		}
-	}
-}
-
 func sessions(panes []Pane) []string {
 	var s []string
 	for _, p := range panes {

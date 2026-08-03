@@ -36,6 +36,9 @@ type Tmux interface {
 	SetSessionOption(session, name, value string) error
 	SetWindowOption(session, name, value string) error
 	SetServerOption(name, value string) error
+	SetGlobalOption(name, value string) error
+	UnsetGlobalOption(name string) error
+	GlobalOption(name string) (string, error)
 	SetPaneTitle(pane, title string) error
 	FindMarkedPane(session, option string) (string, error)
 }
@@ -68,12 +71,12 @@ type Pane struct {
 	DoneSince    time.Time // @coop_done_since — when it finished (zero if unset)
 	NotifiedMark bool      // @coop_notified — this needs-input episode was announced
 
-	Arbiter           bool   // @coop_arbiter — the arbiter's own session
-	ArbiterMode       string // @coop_arbiter_mode — "" off the arbiter session
-	ArbiterNudgedMark bool   // @coop_arbiter_nudged
-	ArbiterNote       string // @coop_arbiter_note — "" when none
-	ArbiterSuggest    string // @coop_arbiter_suggest — digit the note suggests, "" when none
-	ArbiterLast       string // @coop_arbiter_last — "" when never answered
+	// Arbiter episode state. The mode is not here: it is a global option
+	// read once per poll with an explicit `show -gv` (see ArbiterMode),
+	// not per pane.
+	ArbiterNote    string // @coop_arbiter_note — "" when none
+	ArbiterSuggest string // @coop_arbiter_suggest — digit the note suggests, "" when none
+	ArbiterLast    string // @coop_arbiter_last — "" when never answered
 }
 
 // Repo is the pane's repo group: the session start directory's basename.
@@ -127,15 +130,16 @@ const (
 	DoneSinceMarker = "@coop_done_since"
 	NotifiedMarker  = "@coop_notified"
 
-	// Arbiter state. The first two live on the arbiter's own session
-	// (readable from its panes via format inheritance, like HubMarker);
-	// the rest live on the tracked panes, same lifetime rules as the
-	// done/notify markers above.
-	ArbiterMarker       = "@coop_arbiter"        // "1" on the arbiter session
-	ArbiterModeMarker   = "@coop_arbiter_mode"   // "recommend" | "full"
-	ArbiterNudgedMarker = "@coop_arbiter_nudged" // this needs-input episode was nudged
-	ArbiterNoteMarker   = "@coop_arbiter_note"   // escalation note shown on the row
-	// ArbiterSuggestMarker is the digit that note's -suggest named, kept
+	// Arbiter state. ArbiterModeMarker is a global option — every hub and
+	// every judge process on the socket sees the same value; the rest
+	// live on the tracked panes, same lifetime rules as the done/notify
+	// markers above. Every one of them is writable by any process that
+	// can reach this socket, monitored sessions included (see the
+	// arbiter section of CLAUDE.md): they are shared display and episode
+	// state, never a security boundary.
+	ArbiterModeMarker = "@coop_arbiter_mode" // global: "recommend" | "full", unset = off
+	ArbiterNoteMarker = "@coop_arbiter_note" // escalation note shown on the row
+	// ArbiterSuggestMarker is the digit an escalating verdict named, kept
 	// apart from the note text so the space key applies a field rather
 	// than a number parsed out of prose.
 	ArbiterSuggestMarker = "@coop_arbiter_suggest"
@@ -153,7 +157,11 @@ const (
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
+
+// paneFields is paneFormat's field count. parsePanes drops any line that
+// does not have exactly this many, so the two must move together.
+const paneFields = 19
 
 // escapedSep is what tmux ≤ 3.4 prints instead of the \x1f separator:
 // those versions run -F output through vis(3), so every non-printable
@@ -187,7 +195,7 @@ func parsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		f := splitFields(line)
-		if len(f) != 22 {
+		if len(f) != paneFields {
 			continue
 		}
 		pid, _ := strconv.Atoi(f[2]) // unreadable pid just reads as 0 — nothing joins on it
@@ -196,13 +204,11 @@ func parsePanes(out string) []Pane {
 			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
 			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
 			NotifiedMark: f[11] == "1",
-			Arbiter:      f[12] == "1", ArbiterMode: f[13],
-			ArbiterNudgedMark: f[14] == "1", ArbiterNote: f[15],
-			ArbiterSuggest: f[16], ArbiterLast: f[17],
+			ArbiterNote:  f[12], ArbiterSuggest: f[13], ArbiterLast: f[14],
 		}
-		if f[18] != "" {
-			p.Claude = &ClaudeState{Status: f[18], StatusSince: unixTime(f[19]),
-				SessionID: f[20], CWD: f[21]}
+		if f[15] != "" {
+			p.Claude = &ClaudeState{Status: f[15], StatusSince: unixTime(f[16]),
+				SessionID: f[17], CWD: f[18]}
 		}
 		panes = append(panes, p)
 	}
@@ -411,6 +417,27 @@ func (t *ExecTmux) SetWindowOption(session, name, value string) error {
 func (t *ExecTmux) SetServerOption(name, value string) error {
 	_, err := t.run("set-option", "-s", name, value)
 	return err
+}
+
+// SetGlobalOption sets a global (server-wide default) user option. Every
+// session inherits it, so this is where socket-wide state lives — the
+// arbiter's mode is shared by every hub on the socket, and by the
+// judge processes coop hook spawns outside any hub.
+func (t *ExecTmux) SetGlobalOption(name, value string) error {
+	_, err := t.run("set-option", "-g", name, value)
+	return err
+}
+
+func (t *ExecTmux) UnsetGlobalOption(name string) error {
+	_, err := t.run("set-option", "-gu", name)
+	return err
+}
+
+// GlobalOption reads one global user option; -q makes an unset option an
+// empty string rather than an error, same as PaneOption.
+func (t *ExecTmux) GlobalOption(name string) (string, error) {
+	out, err := t.run("show-options", "-gqv", name)
+	return strings.TrimSpace(out), err
 }
 
 // SetPaneTitle sets the pane's title (what #{pane_title} shows in its

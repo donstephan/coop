@@ -37,6 +37,7 @@ type fakeTmux struct {
 
 	windowOpts map[string]string // "session/name" -> value
 	serverOpts map[string]string // name -> value
+	globals    map[string]string // name -> value
 	titles     [][2]string       // {pane, title} per SetPaneTitle call
 
 	paneW, paneH int      // what PaneSize returns
@@ -177,6 +178,32 @@ func (f *fakeTmux) SetServerOption(name, value string) error {
 	return nil
 }
 
+func (f *fakeTmux) SetGlobalOption(name, value string) error {
+	if f.err != nil {
+		return f.err
+	}
+	if f.globals == nil {
+		f.globals = map[string]string{}
+	}
+	f.globals[name] = value
+	return nil
+}
+
+func (f *fakeTmux) UnsetGlobalOption(name string) error {
+	if f.err != nil {
+		return f.err
+	}
+	delete(f.globals, name)
+	return nil
+}
+
+func (f *fakeTmux) GlobalOption(name string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.globals[name], nil
+}
+
 func (f *fakeTmux) SetPaneTitle(pane, title string) error {
 	if f.err != nil {
 		return f.err
@@ -230,7 +257,7 @@ func drive(t *testing.T, m Model, cmd tea.Cmd) Model {
 
 func pollOnce(t *testing.T, f *fakeTmux) Model {
 	t.Helper()
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
 	return drive(t, m, m.poll())
 }
 
@@ -255,7 +282,7 @@ func livePanes() []hub.Pane {
 // Returns the settled model.
 func bootLive(t *testing.T, f *fakeTmux) Model {
 	t.Helper()
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
 	m, cmd := driveCmd(t, m, m.poll()) // pollMsg → ensure cmd
 	m, cmd = driveCmd(t, m, cmd)       // livePaneMsg → retarget cmd
 	m, _ = driveCmd(t, m, cmd)         // retargetMsg
@@ -277,7 +304,7 @@ func TestPollUsesClaudeState(t *testing.T) {
 			Claude: &hub.ClaudeState{SessionID: "abc", Status: "busy"}},
 		{Session: "other", ID: "%2", PID: 99, Title: "⠂ working", Cmd: "claude"},
 	}}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
 	m = drive(t, m, m.poll())
 	if m.panes[0].Status != hub.StatusWorking {
 		t.Errorf("pane with published state: Status = %v, want working", m.panes[0].Status)
@@ -552,7 +579,7 @@ func TestPollSkipsTranscriptsWhenColumnOff(t *testing.T) {
 	panes := testPanes()
 	panes[1].Claude = &hub.ClaudeState{SessionID: "abc", Status: "idle"}
 	f := &fakeTmux{panes: panes}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
 	asked := 0
 	m.transcripts = func(sessionID, cwd string) (hub.TranscriptStats, bool) {
 		asked++
@@ -624,7 +651,7 @@ func TestWindowSizePinsNavWidth(t *testing.T) {
 // arrives, then chain into the preview attach.
 func TestLivePaneMsgPinsNavThenRetargets(t *testing.T) {
 	f := &fakeTmux{panes: livePanes(), marked: "%50"}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "%0", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "%0", "claude", nil, nil, 0)
 	m, cmd := driveCmd(t, m, m.poll()) // pollMsg → ensure cmd
 	m, cmd = driveCmd(t, m, cmd)       // livePaneMsg → resizeSelf cmd
 	m, cmd = driveCmd(t, m, cmd)       // resizedMsg → retarget cmd
@@ -791,16 +818,6 @@ func TestClickBelowTruncatedListIgnored(t *testing.T) {
 	}
 }
 
-// arbiterPane is the pinned arbiter row: hub.SortPanes puts it last, so
-// tests that want it place it last too.
-func arbiterPane(id string, needs bool) hub.Pane {
-	p := hub.Pane{ID: id, Session: "arbiter", Arbiter: true, ArbiterMode: "full"}
-	if needs {
-		p.Status = hub.StatusNeedsInput
-	}
-	return p
-}
-
 func TestNextNeedsInput(t *testing.T) {
 	pane := func(id string, needs bool) hub.Pane {
 		p := hub.Pane{ID: id, Session: "s" + id}
@@ -823,11 +840,6 @@ func TestNextNeedsInput(t *testing.T) {
 		"none":              {[]hub.Pane{pane("%1", false), pane("%2", false)}, "%1", ""},
 		"empty":             {nil, "%1", ""},
 		"unknown selection": {[]hub.Pane{pane("%1", false), pane("%2", true)}, "%99", "%2"},
-		// An arbiter at its own permission prompt is never a tab target.
-		"skips arbiter": {[]hub.Pane{pane("%1", false), pane("%2", false),
-			arbiterPane("%9", true)}, "%1", ""},
-		"skips arbiter for a real session": {[]hub.Pane{pane("%1", false),
-			arbiterPane("%9", true), pane("%3", true)}, "%1", "%3"},
 	}
 	for name, c := range cases {
 		if got := nextNeedsInput(c.panes, c.selected); got != c.want {
@@ -1875,7 +1887,7 @@ func TestLiveTitleForTaskText(t *testing.T) {
 func newPicker(t *testing.T, f *fakeTmux, repos []string) Model {
 	t.Helper()
 	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude",
-		func() ([]string, error) { return repos, nil }, nil, 0, ArbiterConfig{})
+		func() ([]string, error) { return repos, nil }, nil, 0)
 	return drive(t, m, m.poll())
 }
 
@@ -2166,7 +2178,7 @@ func TestPickerConfigErrors(t *testing.T) {
 	f := &fakeTmux{panes: testPanes()}
 	m := New(f, []string{"claude"}, "roost", "cc", "", "claude",
 		func() ([]string, error) { return nil, fmt.Errorf("boom: no config") },
-		nil, 0, ArbiterConfig{})
+		nil, 0)
 	m = drive(t, m, m.poll())
 	next, _ := m.Update(keyRunes("n"))
 	m = next.(Model)
@@ -2434,7 +2446,7 @@ func TestPollShowsDoneAndPreviewFocusClears(t *testing.T) {
 	}
 	f := &fakeTmux{panes: pane("⠂ compiling")}
 	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil,
-		5*time.Minute, ArbiterConfig{})
+		5*time.Minute)
 	m = drive(t, m, m.poll())
 
 	f.panes = pane("✳ Claude Code")
@@ -2473,7 +2485,7 @@ func TestPollPrimaryClientClearsDone(t *testing.T) {
 	}
 	f := &fakeTmux{panes: pane("⠂ compiling")}
 	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil,
-		5*time.Minute, ArbiterConfig{})
+		5*time.Minute)
 	m = drive(t, m, m.poll())
 
 	f.panes = pane("✳ Claude Code")
@@ -2486,81 +2498,73 @@ func TestPollPrimaryClientClearsDone(t *testing.T) {
 
 func TestArbiterKeyCycle(t *testing.T) {
 	f := &fakeTmux{}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0,
-		ArbiterConfig{Model: "sonnet", ConfigDir: t.TempDir()})
-
-	// No arbiter session: a launches one (recommend by construction).
-	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m = mm.(Model)
-	if cmd == nil {
-		t.Fatal("a with no arbiter returned no command")
-	}
-	if msg, ok := cmd().(createdMsg); !ok || msg.err != nil {
-		t.Fatalf("launch = %#v", msg)
-	}
-	if len(f.created) != 1 || f.created[0][0] != hub.ArbiterSession {
-		t.Fatalf("created = %v", f.created)
-	}
-	// The hub's real allowlist rides into the session's env (M3 plumbing).
-	if !strings.Contains(f.created[0][2], "COOP_ALLOWED_CMDS='claude'") {
-		t.Errorf("arbiter cmd = %q, want the hub's allowed-cmds in its env", f.created[0][2])
-	}
-
-	// Arbiter in recommend: a flips the mode option to full.
-	m.panes = []hub.Pane{{Session: "arbiter", ID: "%9", Arbiter: true,
-		ArbiterMode: "recommend"}}
-	mm, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m = mm.(Model)
-	if cmd == nil {
-		t.Fatal("a in recommend returned no command")
-	}
-	cmd()
-	if f.sessionOpts["arbiter/"+hub.ArbiterModeMarker] != hub.ArbiterModeFull {
-		t.Errorf("mode option = %q", f.sessionOpts["arbiter/"+hub.ArbiterModeMarker])
-	}
-
-	// Arbiter in full: a arms the kill confirm (y/esc like x).
-	m.panes[0].ArbiterMode = "full"
-	mm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m = mm.(Model)
-	if m.confirmKill != "arbiter" {
-		t.Errorf("confirmKill = %q, want arbiter", m.confirmKill)
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	for _, tc := range []struct{ from, want string }{
+		{hub.ArbiterModeOff, hub.ArbiterModeRecommend},
+		{hub.ArbiterModeRecommend, hub.ArbiterModeFull},
+		{hub.ArbiterModeFull, hub.ArbiterModeOff},
+	} {
+		m.arbiterMode = tc.from
+		next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+		m = next.(Model)
+		if m.arbiterMode != tc.want {
+			t.Errorf("from %s: mode = %s, want %s", tc.from, m.arbiterMode, tc.want)
+		}
+		if cmd == nil {
+			t.Fatalf("from %s: want a command writing the option", tc.from)
+		}
+		// Run it: the optimistic model field is not the state anything
+		// else reads. Every hub and every judge process on the socket
+		// takes the mode from this one global option, so a write that
+		// went to a session — or wrote the wrong value — would leave the
+		// judges off while the footer says otherwise.
+		cmd()
+		got, ok := f.globals[hub.ArbiterModeMarker]
+		if tc.want == hub.ArbiterModeOff {
+			if ok {
+				t.Errorf("from %s: off should unset the option, got %q", tc.from, got)
+			}
+		} else if got != tc.want {
+			t.Errorf("from %s: global option = %q, want %q", tc.from, got, tc.want)
+		}
+		if len(f.sessionOpts) != 0 {
+			t.Errorf("from %s: mode wrote a session option: %v", tc.from, f.sessionOpts)
+		}
+		if m.confirmKill != "" {
+			t.Errorf("from %s: turning the arbiter off is an option write, not a kill", tc.from)
+		}
 	}
 }
 
-// The a key arms the one-shot catch-up the moment it launches the
-// arbiter, before the create even lands — poll must not skip a nudge
-// window while createdMsg is still in flight. A failed launch then
-// clears the flag: there is no arbiter to run a catch-up against.
-func TestArbiterLaunchSetsCatchup(t *testing.T) {
-	f := &fakeTmux{}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0,
-		ArbiterConfig{Model: "sonnet", ConfigDir: t.TempDir()})
+// The mode the poll reads off the socket has to reach the model, or the
+// footer permanently reads "a arbiter off" while judges are running —
+// and the first a keypress cycles from the wrong place.
+func TestPollCarriesArbiterModeIntoModel(t *testing.T) {
+	f := &fakeTmux{panes: testPanes(),
+		globals: map[string]string{hub.ArbiterModeMarker: hub.ArbiterModeFull}}
+	m := pollOnce(t, f)
+	if m.arbiterMode != hub.ArbiterModeFull {
+		t.Errorf("arbiterMode = %q, want %q", m.arbiterMode, hub.ArbiterModeFull)
+	}
+	if got := m.arbiterHint(); got != "a arbiter full" {
+		t.Errorf("hint = %q", got)
+	}
+}
 
-	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	m = mm.(Model)
-	if !m.arbiterCatchup {
-		t.Fatal("a with no arbiter did not arm the catch-up flag")
+func TestArbiterHintShowsMode(t *testing.T) {
+	m := New(&fakeTmux{}, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m.arbiterMode = hub.ArbiterModeFull
+	if got := m.arbiterHint(); got != "a arbiter full" {
+		t.Errorf("got %q", got)
 	}
-	if cmd == nil {
-		t.Fatal("a with no arbiter returned no command")
-	}
-
-	f.err = errors.New("launch failed")
-	msg := cmd()
-	created, ok := msg.(createdMsg)
-	if !ok || !created.arbiter || created.err == nil {
-		t.Fatalf("createdMsg = %#v", msg)
-	}
-	mm, _ = m.Update(created)
-	m = mm.(Model)
-	if m.arbiterCatchup {
-		t.Error("failed launch left the catch-up flag armed")
+	m.arbiterMode = hub.ArbiterModeOff
+	if got := m.arbiterHint(); got != "a arbiter off" {
+		t.Errorf("got %q", got)
 	}
 }
 
 func TestArbiterFooterDetail(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: "asking to run tests — suggest 1"}}
 	m.selectedID = "%1"
@@ -2578,7 +2582,7 @@ func TestArbiterFooterDetail(t *testing.T) {
 // digit keys use, and advertises itself only on a row that has one.
 func TestSpaceAppliesArbiterSuggestion(t *testing.T) {
 	f := &fakeTmux{cmd: "claude"}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1", Status: hub.StatusNeedsInput,
 		ArbiterNote: "asking to run tests", ArbiterSuggest: "2"}}
 	m.selectedID = "%1"
@@ -2612,135 +2616,16 @@ func TestSpaceAppliesArbiterSuggestion(t *testing.T) {
 	}
 }
 
-func TestArbiterRowMarkAndHint(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+// The ! mark beside the status glyph is the arbiter's escalation note —
+// its only remaining visible trace on an ordinary row now that there is
+// no arbiter row of its own.
+func TestArbiterRowMark(t *testing.T) {
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: "note"}}
 	m.selectedID = "%1"
 	if nav := m.viewNav(); !strings.Contains(nav, "◆!") {
 		t.Errorf("nav = %q, want the ! mark beside the status glyph", nav)
-	}
-	if foot := m.viewFooter(); !strings.Contains(foot, "a arbiter off") {
-		t.Errorf("footer = %q, want the off hint", foot)
-	}
-	m.panes = append(m.panes, hub.Pane{Session: "arbiter", ID: "%9",
-		Arbiter: true, ArbiterMode: "full"})
-	if foot := m.viewFooter(); !strings.Contains(foot, "a arbiter full") {
-		t.Errorf("footer = %q, want the full hint", foot)
-	}
-}
-
-// The arbiter draws under its own divider with a fixed mode label:
-// Claude's derived title names whatever it last triaged, which reads as
-// a work session in that repo. Nor is it one of the watched sessions the
-// header counts.
-func TestArbiterPinnedRow(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	m.panes = []hub.Pane{
-		{Session: "alpha", ID: "%1", Path: "/home/user/sprocket-v2", Title: "✳ Claude Code"},
-		{Session: "arbiter", ID: "%9", Path: "/home/user/.config/coop/arbiter",
-			Arbiter: true, ArbiterMode: "full",
-			Title: "✳ Sprocket v2 implementation review"},
-	}
-	m.selectedID = "%1"
-	nav := m.viewNav()
-	if !strings.Contains(nav, "─ arbiter ─") {
-		t.Errorf("nav = %q, want the arbiter divider", nav)
-	}
-	if !strings.Contains(nav, "arbiter · full") {
-		t.Errorf("nav = %q, want the fixed mode label", nav)
-	}
-	if strings.Contains(nav, "Sprocket v2 implementation") {
-		t.Errorf("nav = %q, should not show the arbiter's derived title", nav)
-	}
-	if !strings.Contains(nav, "1 sessions") {
-		t.Errorf("nav = %q, want the arbiter left out of the count", nav)
-	}
-}
-
-// paneAt has to mirror the pinned section's two opening lines or every
-// click below the divider lands on the wrong row.
-func TestPaneAtWithPinnedArbiter(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	m.width, m.height = navWidth, 24
-	m.panes = []hub.Pane{
-		{Session: "alpha", ID: "%1", Path: "/home/user/sprocket-v2", Title: "✳ Claude Code"},
-		arbiterPane("%9", false),
-	}
-	m.selectedID = "%1"
-	// border, title, blank, then: repo header, alpha, blank, divider, arbiter.
-	for y, want := range map[int]string{3: "", 4: "%1", 5: "", 6: "", 7: "%9", 8: ""} {
-		if got := m.paneAt(y); got != want {
-			t.Errorf("paneAt(%d) = %q, want %q", y, got, want)
-		}
-	}
-}
-
-// x on the pinned row is the arbiter's off switch — the same y/esc
-// confirm the a key's full → off arms, named so it reads plainly.
-func TestKillArbiterRowConfirmsByName(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	m.panes = []hub.Pane{
-		{Session: "alpha", ID: "%1", Path: "/home/user/sprocket-v2"},
-		arbiterPane("%9", false),
-	}
-	m.selectedID = "%9"
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
-	m = next.(Model)
-	if m.confirmKill != "arbiter" {
-		t.Fatalf("confirmKill = %q, want arbiter", m.confirmKill)
-	}
-	if foot := m.viewFooter(); !strings.Contains(foot, "kill arbiter?") {
-		t.Errorf("footer = %q, want the named confirm", foot)
-	}
-}
-
-// Launching the arbiter arms a one-shot catch-up: the first poll that
-// sees an old-enough arbiter nudges already-waiting hook panes, then
-// the flag clears.
-func TestArbiterLaunchCatchup(t *testing.T) {
-	f := &fakeTmux{panes: []hub.Pane{
-		{Session: "alpha", ID: "%1", Title: "✳ Claude Code",
-			Claude: &hub.ClaudeState{Status: "waiting"}},
-		{Session: "arbiter", ID: "%9", Arbiter: true,
-			Created: time.Now().Add(-5 * time.Second)},
-	}}
-	m := pollOnce(t, f)
-	m.arbiterCatchup = true
-	m = drive(t, m, m.poll())
-	if m.arbiterCatchup {
-		t.Error("flag should clear once the catch-up ran")
-	}
-	found := false
-	for _, keys := range f.sent {
-		if strings.Contains(keys[0], `session "alpha" needs input`) {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("no catch-up nudge in sent keys: %v", f.sent)
-	}
-}
-
-// A young arbiter defers the catch-up to a later tick instead of
-// typing into the key-swallow window.
-func TestArbiterLaunchCatchupWaitsForAge(t *testing.T) {
-	f := &fakeTmux{panes: []hub.Pane{
-		{Session: "alpha", ID: "%1", Title: "✳ Claude Code",
-			Claude: &hub.ClaudeState{Status: "waiting"}},
-		// Still under hub.ArbiterReady's floor (arbiterReadyAge + 1s, to
-		// absorb session_created's whole-second truncation) — plain
-		// time.Now() is well inside it.
-		{Session: "arbiter", ID: "%9", Arbiter: true, Created: time.Now()},
-	}}
-	m := pollOnce(t, f)
-	m.arbiterCatchup = true
-	m = drive(t, m, m.poll())
-	if !m.arbiterCatchup {
-		t.Error("flag consumed before the arbiter was old enough")
-	}
-	if len(f.sent) != 0 {
-		t.Errorf("typed at a fresh arbiter: %v", f.sent)
 	}
 }
 
@@ -2797,7 +2682,7 @@ const longNote = "Approval to run a python3 script regenerating the golden " +
 
 func msgBoxModel(t *testing.T, note string) Model {
 	t.Helper()
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
 	m.width, m.height = navWidth, 40
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: note}}

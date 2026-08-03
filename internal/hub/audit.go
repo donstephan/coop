@@ -23,18 +23,41 @@ type AuditEntry struct {
 	Dialog  string `json:"dialog,omitempty"`
 }
 
-// DefaultAuditPath is $XDG_STATE_HOME/coop/arbiter-audit.jsonl, falling
-// back to ~/.local/state. "" (no home) disables auditing gracefully —
-// AppendAudit then errors and callers report it as a warning.
-func DefaultAuditPath() string {
+// stateDir resolves $XDG_STATE_HOME/coop, falling back to
+// ~/.local/state/coop. "" (no home) lets callers disable gracefully
+// rather than erroring on a path that can never be right.
+func stateDir() string {
 	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
-		return filepath.Join(d, "coop", "arbiter-audit.jsonl")
+		return filepath.Join(d, "coop")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".local", "state", "coop", "arbiter-audit.jsonl")
+	return filepath.Join(home, ".local", "state", "coop")
+}
+
+// DefaultAuditPath is $XDG_STATE_HOME/coop/arbiter-audit.jsonl, falling
+// back to ~/.local/state. "" (no home) disables auditing gracefully —
+// AppendAudit then errors and callers report it as a warning.
+func DefaultAuditPath() string {
+	dir := stateDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "arbiter-audit.jsonl")
+}
+
+// DefaultJudgeLogPath is $XDG_STATE_HOME/coop/judge.log, alongside the
+// audit log but deliberately separate from it: the audit log is a record
+// of actions taken, this is prompts, raw verdicts and failures. "" (no
+// home) disables logging gracefully.
+func DefaultJudgeLogPath() string {
+	dir := stateDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "judge.log")
 }
 
 // AppendAudit appends one entry, creating the directory on first use.

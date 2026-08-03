@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,86 +9,41 @@ import (
 	"time"
 )
 
-func TestFindArbiter(t *testing.T) {
-	panes := []Pane{
-		{Session: "alpha", ID: "%1"},
-		{Session: "arbiter", ID: "%2", Arbiter: true, ArbiterMode: "full"},
-	}
-	arb, ok := FindArbiter(panes)
-	if !ok || arb.ID != "%2" {
-		t.Fatalf("FindArbiter = %v %v, want %%2 true", arb.ID, ok)
-	}
-	if _, ok := FindArbiter(panes[:1]); ok {
-		t.Error("found an arbiter in a list without one")
-	}
-}
-
-func TestArbiterModeOf(t *testing.T) {
-	if m := ArbiterModeOf(Pane{ArbiterMode: "full"}); m != ArbiterModeFull {
-		t.Errorf("full pane = %q", m)
-	}
-	// Anything else — unset, garbage — reads as the safe mode.
-	if m := ArbiterModeOf(Pane{ArbiterMode: "yolo"}); m != ArbiterModeRecommend {
-		t.Errorf("garbage mode = %q, want recommend", m)
-	}
-	if m := ArbiterModeOf(Pane{}); m != ArbiterModeRecommend {
-		t.Errorf("unset mode = %q, want recommend", m)
+func TestArbiterModeReadsGlobalOption(t *testing.T) {
+	for _, tc := range []struct{ set, want string }{
+		{"", ArbiterModeOff},
+		{"off", ArbiterModeOff},
+		{"recommend", ArbiterModeRecommend},
+		{"full", ArbiterModeFull},
+		{"gremlin", ArbiterModeOff}, // a later coop's value never enables answering
+	} {
+		f := &fakeTmux{globals: map[string]string{ArbiterModeMarker: tc.set}}
+		if got := ArbiterMode(f); got != tc.want {
+			t.Errorf("ArbiterMode(%q) = %q, want %q", tc.set, got, tc.want)
+		}
 	}
 }
 
-func TestNudgeText(t *testing.T) {
-	got := NudgeText("sprocket-v2", "recommend", "")
-	if !strings.Contains(got, `"sprocket-v2"`) || !strings.Contains(got, "recommend") {
-		t.Errorf("NudgeText = %q", got)
+func TestSetArbiterModeOffUnsets(t *testing.T) {
+	f := &fakeTmux{globals: map[string]string{ArbiterModeMarker: "full"}}
+	if err := SetArbiterMode(f, ArbiterModeOff); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.globals[ArbiterModeMarker]; ok {
+		t.Error("off should unset the option, not write a value")
+	}
+	if err := SetArbiterMode(f, ArbiterModeRecommend); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.globals[ArbiterModeMarker]; got != ArbiterModeRecommend {
+		t.Errorf("got %q, want %q", got, ArbiterModeRecommend)
 	}
 }
 
-func TestNudgeTextDetail(t *testing.T) {
-	if got := NudgeText("alpha", "recommend", ""); got != `coop: session "alpha" needs input (mode: recommend)` {
-		t.Errorf("plain form changed: %q", got)
-	}
-	if got := NudgeText("alpha", "full", "Bash: npm test"); got != `coop: session "alpha" needs input (mode: full; trigger: Bash: npm test)` {
-		t.Errorf("detail form: %q", got)
-	}
-	// Control bytes and newlines in the detail are typed into a live
-	// claude pane — they must be flattened, and the whole line capped.
-	got := NudgeText("alpha", "full", "Bash: rm\n-rf \x1b[31m"+strings.Repeat("x", 400))
-	if strings.ContainsAny(got, "\n\x1b") {
-		t.Errorf("detail not sanitized: %q", got)
-	}
-	if n := len([]rune(got)); n > 220 {
-		t.Errorf("nudge line %d runes, want ≤220", n)
-	}
-}
-
-func TestCatchupNudge(t *testing.T) {
-	arb := Pane{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"}
-	panes := []Pane{
-		// hook-published waiting, un-nudged: gets the catch-up
-		{Session: "alpha", ID: "%1", Claude: &ClaudeState{Status: "waiting"}},
-		// already nudged: skipped
-		{Session: "beta", ID: "%2", Claude: &ClaudeState{Status: "waiting"}, ArbiterNudgedMark: true},
-		// busy: skipped
-		{Session: "gamma", ID: "%3", Claude: &ClaudeState{Status: "busy"}},
-		// title-tier needs-input with no hook state: skipped — nothing
-		// would ever clear a marker set here
-		{Session: "delta", ID: "%4", Title: "🔔 pick one"},
-		arb,
-		{Session: "roost", ID: "%0", Hub: true},
-	}
-	f := &fakeTmux{}
-	CatchupNudge(f, panes, arb)
-	if len(f.sent) != 1 {
-		t.Fatalf("sent = %v, want exactly alpha's nudge", f.sent)
-	}
-	if want := `coop: session "alpha" needs input (mode: full)`; f.sent[0][0] != want {
-		t.Errorf("nudge = %q, want %q", f.sent[0][0], want)
-	}
-	if f.paneOpts["%1/"+ArbiterNudgedMarker] != "1" {
-		t.Error("alpha's marker not set")
-	}
-	if _, ok := f.paneOpts["%4/"+ArbiterNudgedMarker]; ok {
-		t.Error("title-tier pane acquired a marker")
+func TestArbiterModeErrorReadsOff(t *testing.T) {
+	f := &fakeTmux{err: errors.New("no server")}
+	if got := ArbiterMode(f); got != ArbiterModeOff {
+		t.Errorf("got %q, want off on error", got)
 	}
 }
 
@@ -99,7 +55,7 @@ func TestRetireStaleEpisodes(t *testing.T) {
 	panes := []Pane{
 		// idle, no hook state: every marker retires
 		{Session: "alpha", ID: "%1", Status: StatusIdle,
-			ArbiterNudgedMark: true, ArbiterNote: "old note", ArbiterSuggest: "2"},
+			ArbiterNote: "old note", ArbiterSuggest: "2"},
 		// hook pane (Claude set): ApplyHook owns its cleanup, untouched here
 		{Session: "beta", ID: "%2", Status: StatusIdle, Claude: &ClaudeState{},
 			ArbiterNote: "still fresh"},
@@ -107,15 +63,11 @@ func TestRetireStaleEpisodes(t *testing.T) {
 		// the episode isn't over yet
 		{Session: "gamma", ID: "%3", Status: StatusNeedsInput, Title: "🔔 pick one",
 			ArbiterNote: "asking something"},
-		// coop's own sessions are never targets
+		// coop's own hub session is never a target
 		{Session: "roost", ID: "%0", Hub: true, ArbiterNote: "n/a"},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterNote: "n/a"},
 	}
 	f := &fakeTmux{panes: panes}
 	for _, p := range panes {
-		if p.ArbiterNudgedMark {
-			f.SetPaneOption(p.ID, ArbiterNudgedMarker, "1")
-		}
 		if p.ArbiterNote != "" {
 			f.SetPaneOption(p.ID, ArbiterNoteMarker, p.ArbiterNote)
 		}
@@ -124,7 +76,7 @@ func TestRetireStaleEpisodes(t *testing.T) {
 		}
 	}
 	RetireStaleEpisodes(f, panes)
-	for _, m := range []string{ArbiterNudgedMarker, ArbiterNoteMarker, ArbiterSuggestMarker} {
+	for _, m := range []string{ArbiterNoteMarker, ArbiterSuggestMarker} {
 		if _, ok := f.paneOpts["%1/"+m]; ok {
 			t.Errorf("alpha's %s survived retirement", m)
 		}
@@ -137,9 +89,6 @@ func TestRetireStaleEpisodes(t *testing.T) {
 	}
 	if f.paneOpts["%0/"+ArbiterNoteMarker] != "n/a" {
 		t.Error("hub pane's note was touched")
-	}
-	if f.paneOpts["%9/"+ArbiterNoteMarker] != "n/a" {
-		t.Error("arbiter pane's own note was touched")
 	}
 }
 
@@ -194,12 +143,12 @@ func TestSanitizeNote(t *testing.T) {
 	}
 }
 
-// arbiterPanes is a socket with one target session and a full-mode
-// arbiter — the baseline every gate test perturbs.
+// arbiterPanes is a socket with one target session — the baseline every
+// gate test perturbs. The arbiter mode itself is a global tmux option
+// now (see fakeTmux.globals), not carried by any pane.
 func arbiterPanes() []Pane {
 	return []Pane{
 		{Session: "alpha", ID: "%1", PID: 0},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"},
 	}
 }
 
@@ -207,8 +156,9 @@ const dialogScreen = "Do you want to run go test?\n❯ 1. Yes\n  2. No\n"
 
 func TestAnswerHappyPath(t *testing.T) {
 	audit := filepath.Join(t.TempDir(), "audit.jsonl")
-	f := &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen}
-	warn, err := Answer(f, AnswerReq{Session: "alpha", Digit: "1",
+	f := &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen,
+		globals: map[string]string{ArbiterModeMarker: "full"}}
+	warn, err := Answer(f, AnswerReq{PaneID: "%1", Digit: "1",
 		Reason: "policy allows tests", Allowed: []string{"claude", "node"},
 		Audit: audit, Now: time.Unix(1700000100, 0)})
 	if err != nil || warn != "" {
@@ -231,37 +181,65 @@ func TestAnswerHappyPath(t *testing.T) {
 	}
 }
 
+// A whole model turn sits between the screen the verdict was formed on
+// and this send. If the human answers that dialog and claude opens
+// another, every other gate still passes — a numbered dialog is on
+// screen, the pane runs claude — and the digit lands in a dialog policy
+// never saw. @coop_status_since is what tells the two apart.
+func TestAnswerRefusesADifferentEpisode(t *testing.T) {
+	episode := time.Unix(1700000000, 0)
+	f := &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen,
+		globals: map[string]string{ArbiterModeMarker: "full"}}
+	f.SetPaneOption("%1", ClaudeSinceMarker, "1700000600") // the next dialog
+	req := AnswerReq{PaneID: "%1", Digit: "1", Reason: "policy allows tests",
+		Allowed: []string{"claude"}, Now: time.Unix(1700000700, 0), Since: episode}
+	if _, err := Answer(f, req); err == nil ||
+		!strings.Contains(err.Error(), "different dialog") {
+		t.Fatalf("err = %v, want a refusal naming the dialog", err)
+	}
+	if len(f.sent) != 0 {
+		t.Errorf("digit sent into an unjudged dialog: %v", f.sent)
+	}
+	// The same episode still answers, so the gate is identity and not a
+	// blanket refusal.
+	f.SetPaneOption("%1", ClaudeSinceMarker, "1700000000")
+	if _, err := Answer(f, req); err != nil {
+		t.Fatalf("Answer on the judged episode = %v", err)
+	}
+	if len(f.sent) != 1 {
+		t.Errorf("sent %v, want the digit", f.sent)
+	}
+}
+
 func TestAnswerGates(t *testing.T) {
 	audit := filepath.Join(t.TempDir(), "audit.jsonl")
 	base := func() AnswerReq {
-		return AnswerReq{Session: "alpha", Digit: "1", Reason: "r",
+		return AnswerReq{PaneID: "%1", Digit: "1", Reason: "r",
 			Allowed: []string{"claude"}, Audit: audit, Now: time.Unix(1700000100, 0)}
 	}
+	full := map[string]string{ArbiterModeMarker: "full"}
 	cases := []struct {
 		name string
 		tm   *fakeTmux
 		req  AnswerReq
 		want string
 	}{
-		{"bad digit", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen},
-			AnswerReq{Session: "alpha", Digit: "12", Reason: "r", Allowed: []string{"claude"}, Audit: audit}, "digit"},
-		{"no reason", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen},
-			AnswerReq{Session: "alpha", Digit: "1", Allowed: []string{"claude"}, Audit: audit}, "reason"},
-		{"unknown session", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen},
-			func() AnswerReq { r := base(); r.Session = "ghost"; return r }(), "no session"},
-		{"hub target", &fakeTmux{panes: []Pane{{Session: "roost", ID: "%0", Hub: true},
-			{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"}}, cmd: "claude", screen: dialogScreen},
-			func() AnswerReq { r := base(); r.Session = "roost"; return r }(), "coop's own"},
-		{"arbiter target", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen},
-			func() AnswerReq { r := base(); r.Session = "arbiter"; return r }(), "coop's own"},
-		{"no arbiter", &fakeTmux{panes: arbiterPanes()[:1], cmd: "claude", screen: dialogScreen},
-			base(), "no arbiter"},
-		{"recommend mode", &fakeTmux{panes: []Pane{{Session: "alpha", ID: "%1"},
-			{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "recommend"}},
-			cmd: "claude", screen: dialogScreen}, base(), "recommend-only"},
-		{"disallowed cmd", &fakeTmux{panes: arbiterPanes(), cmd: "bash", screen: dialogScreen},
+		{"bad digit", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen, globals: full},
+			AnswerReq{PaneID: "%1", Digit: "12", Reason: "r", Allowed: []string{"claude"}, Audit: audit}, "digit"},
+		{"no reason", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen, globals: full},
+			AnswerReq{PaneID: "%1", Digit: "1", Allowed: []string{"claude"}, Audit: audit}, "reason"},
+		{"unknown pane", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen, globals: full},
+			func() AnswerReq { r := base(); r.PaneID = "%9"; return r }(), "no pane"},
+		{"hub target", &fakeTmux{panes: []Pane{{Session: "roost", ID: "%0", Hub: true}},
+			cmd: "claude", screen: dialogScreen, globals: full},
+			func() AnswerReq { r := base(); r.PaneID = "%0"; return r }(), "coop's own"},
+		{"mode off", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen},
+			base(), "full mode"},
+		{"recommend mode", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: dialogScreen,
+			globals: map[string]string{ArbiterModeMarker: "recommend"}}, base(), "full mode"},
+		{"disallowed cmd", &fakeTmux{panes: arbiterPanes(), cmd: "bash", screen: dialogScreen, globals: full},
 			base(), "refusing"},
-		{"no dialog", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: "just chatting\n"},
+		{"no dialog", &fakeTmux{panes: arbiterPanes(), cmd: "claude", screen: "just chatting\n", globals: full},
 			base(), "no open dialog"},
 	}
 	for _, c := range cases {
@@ -280,7 +258,7 @@ func TestAnswerGates(t *testing.T) {
 func TestNote(t *testing.T) {
 	audit := filepath.Join(t.TempDir(), "audit.jsonl")
 	f := &fakeTmux{panes: arbiterPanes()}
-	warn, err := Note(f, NoteReq{Session: "alpha", Text: "asking to drop a table\n— suggest 2",
+	warn, err := Note(f, NoteReq{PaneID: "%1", Text: "asking to drop a table\n— suggest 2",
 		Audit: audit, Now: time.Unix(1700000100, 0)})
 	if err != nil || warn != "" {
 		t.Fatalf("Note = %q, %v", warn, err)
@@ -293,8 +271,9 @@ func TestNote(t *testing.T) {
 	if !strings.Contains(string(raw), `"action":"escalated"`) {
 		t.Errorf("audit = %s", raw)
 	}
-	if _, err := Note(f, NoteReq{Session: "arbiter", Text: "x", Audit: audit}); err == nil {
-		t.Error("noted the arbiter itself")
+	hub := &fakeTmux{panes: []Pane{{Session: "roost", ID: "%0", Hub: true}}}
+	if _, err := Note(hub, NoteReq{PaneID: "%0", Text: "x", Audit: audit}); err == nil {
+		t.Error("noted coop's own hub session")
 	}
 }
 
@@ -304,7 +283,7 @@ func TestNote(t *testing.T) {
 func TestNoteSuggest(t *testing.T) {
 	audit := filepath.Join(t.TempDir(), "audit.jsonl")
 	f := &fakeTmux{panes: arbiterPanes()}
-	if _, err := Note(f, NoteReq{Session: "alpha", Text: "asking to run tests",
+	if _, err := Note(f, NoteReq{PaneID: "%1", Text: "asking to run tests",
 		Suggest: "2", Audit: audit, Now: time.Unix(1700000100, 0)}); err != nil {
 		t.Fatalf("Note = %v", err)
 	}
@@ -315,7 +294,7 @@ func TestNoteSuggest(t *testing.T) {
 	if !strings.Contains(string(raw), `"suggest":"2"`) {
 		t.Errorf("audit = %s", raw)
 	}
-	if _, err := Note(f, NoteReq{Session: "alpha", Text: "now asking something else",
+	if _, err := Note(f, NoteReq{PaneID: "%1", Text: "now asking something else",
 		Audit: audit, Now: time.Unix(1700000200, 0)}); err != nil {
 		t.Fatalf("Note = %v", err)
 	}
@@ -325,7 +304,7 @@ func TestNoteSuggest(t *testing.T) {
 
 	// A bad digit is refused before anything is written.
 	f = &fakeTmux{panes: arbiterPanes()}
-	if _, err := Note(f, NoteReq{Session: "alpha", Text: "t", Suggest: "12",
+	if _, err := Note(f, NoteReq{PaneID: "%1", Text: "t", Suggest: "12",
 		Audit: audit}); err == nil || !strings.Contains(err.Error(), "single 0-9") {
 		t.Errorf("err = %v, want a suggest-shape refusal", err)
 	}
@@ -374,7 +353,6 @@ func TestPeekWithClaudeState(t *testing.T) {
 	panes := []Pane{
 		{Session: "alpha", ID: "%1",
 			Claude: &ClaudeState{SessionID: "sess-1", CWD: "/home/user/sprocket-v2"}},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"},
 	}
 	f := &fakeTmux{panes: panes, screen: "screen text\n"}
 	out, err := Peek(f, tr, "alpha")
@@ -410,75 +388,6 @@ func TestPeekClaudeStateNoTranscript(t *testing.T) {
 	}
 }
 
-func TestArbiterHomeSeedsOnce(t *testing.T) {
-	cfg := t.TempDir()
-	dir, err := ArbiterHome(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dir != filepath.Join(cfg, "arbiter") {
-		t.Errorf("dir = %q", dir)
-	}
-	settings, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{`"Bash(coop peek:*)"`, `"Bash(coop answer:*)"`, `"Bash(coop note:*)"`} {
-		if !strings.Contains(string(settings), want) {
-			t.Errorf("settings = %s, want %s", settings, want)
-		}
-	}
-	policyPath := filepath.Join(cfg, "arbiter.md")
-	if _, err := os.Stat(policyPath); err != nil {
-		t.Fatal(err)
-	}
-	// Existing files are the user's — a second call must not overwrite.
-	if err := os.WriteFile(policyPath, []byte("my rules"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ArbiterHome(cfg); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := os.ReadFile(policyPath)
-	if string(got) != "my rules" {
-		t.Error("ArbiterHome overwrote an existing policy")
-	}
-}
-
-func TestArbiterCmdQuoting(t *testing.T) {
-	cmd := ArbiterCmd("claude,node", "claude", "sonnet", "don't approve pushes")
-	if !strings.HasPrefix(cmd, "COOP_ALLOWED_CMDS='claude,node' claude --model 'sonnet' --append-system-prompt '") {
-		t.Errorf("cmd = %q", cmd)
-	}
-	// The policy's single quote must survive shell parsing: ' -> '\''
-	if !strings.Contains(cmd, `don'\''t`) {
-		t.Errorf("quote not escaped: %q", cmd)
-	}
-}
-
-func TestLaunchArbiter(t *testing.T) {
-	f := &fakeTmux{}
-	cfg := t.TempDir()
-	if err := LaunchArbiter(f, cfg, "claude,node", "claude", "sonnet", 120, 40); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.created) != 1 {
-		t.Fatalf("created %d sessions", len(f.created))
-	}
-	c := f.created[0]
-	if c[0] != ArbiterSession || c[1] != filepath.Join(cfg, "arbiter") {
-		t.Errorf("created = %v", c)
-	}
-	if !strings.Contains(c[2], "COOP_ALLOWED_CMDS='claude,node'") {
-		t.Errorf("cmd missing allowed-cmds env prefix: %q", c[2])
-	}
-	if !strings.Contains(c[2], "--append-system-prompt") {
-		t.Errorf("cmd = %q", c[2])
-	}
-	if f.sessionOpts[ArbiterSession+"/"+ArbiterMarker] != "1" {
-		t.Error("arbiter marker not set")
-	}
-	if f.sessionOpts[ArbiterSession+"/"+ArbiterModeMarker] != ArbiterModeRecommend {
-		t.Error("mode not seeded to recommend")
-	}
-}
+// ArbiterHome's own behavior (seeding arbiter.md, no settings.json) is
+// covered by TestArbiterHomeSeedsPolicyAndNoSettings and
+// TestArbiterHomeLeavesExistingPolicyAlone in judgeexec_test.go.

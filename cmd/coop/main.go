@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -189,14 +188,21 @@ func main() {
 		os.Exit(runHookCLI(os.Stdin, os.Getenv))
 	}
 
-	// Helper subcommands (the arbiter's tools) bypass the TUI entirely.
+	// coop peek: a human debug aid, and the same pre-flag dispatch for
+	// the same reason — another process calling in must not pay for a TUI
+	// it will never draw.
 	if isArbiterCmd(os.Args[1:]) {
 		os.Exit(runArbiterCLI(os.Args[1:], os.Stdout, os.Stderr))
 	}
 
+	// One headless triage episode, spawned detached by coop hook.
+	if isJudgeCmd(os.Args[1:]) {
+		os.Exit(runJudgeCLI(os.Args[1:]))
+	}
+
 	socket := flag.String("socket", envOr("COOP_SOCKET", "coop"),
 		"tmux socket name (tmux -L)")
-	cmds := flag.String("allowed-cmds", envOr("COOP_ALLOWED_CMDS", "claude,node"),
+	cmds := flag.String("allowed-cmds", envOr("COOP_ALLOWED_CMDS", hub.DefaultAllowedCmds),
 		"comma-separated pane_current_command values digit answers may target")
 	configPath := flag.String("config", envOr("COOP_CONFIG", config.DefaultPath()),
 		"config.json listing repos for the new-session picker")
@@ -275,18 +281,8 @@ func main() {
 	addRepo := func(repo string) (string, error) {
 		return config.AddRepo(*configPath, repo)
 	}
-	var arbCfg tui.ArbiterConfig
-	// Only derive a config dir from an actual config path — "" would
-	// resolve to "." via filepath.Dir and seed an arbiter/ in the cwd
-	// instead of leaving the TUI's "no config dir" guard to fire.
-	if *configPath != "" {
-		arbCfg.ConfigDir = filepath.Dir(*configPath)
-	}
-	if c, err := config.Load(*configPath); err == nil {
-		arbCfg.Model = c.Arbiter.Model
-	}
 	m := tui.New(tm, splitCmds(*cmds), hubSession, *socket,
-		os.Getenv("TMUX_PANE"), launchCmd, loadRepos, addRepo, ttl, arbCfg)
+		os.Getenv("TMUX_PANE"), launchCmd, loadRepos, addRepo, ttl)
 	final, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(),
 		tea.WithMouseCellMotion()).Run()
 	if fm, ok := final.(tui.Model); ok {

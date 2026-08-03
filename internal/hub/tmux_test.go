@@ -12,12 +12,13 @@ import (
 )
 
 // Real output shape: fields joined by \x1f (unit separator — pane titles
-// can contain spaces and even tabs, but never \x1f). The last four
-// fields are user options (@coop, @coop_working,
-// @coop_done_since, @coop_notified), empty when unset.
+// can contain spaces and even tabs, but never \x1f). Everything after
+// session_path is a user option (@coop, @coop_working, @coop_done_since,
+// @coop_notified, the arbiter episode markers, the hook-published Claude
+// state), empty when unset — paneFields of them in all.
 func TestParsePanes(t *testing.T) {
-	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
-		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n"
+	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
+		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n"
 	panes := parsePanes(out)
 	if len(panes) != 2 {
 		t.Fatalf("got %d panes, want 2", len(panes))
@@ -43,13 +44,13 @@ func TestParsePanes(t *testing.T) {
 }
 
 func TestParsePanesDoneSince(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].DoneSince.Equal(time.Unix(1753286000, 0)) {
 		t.Fatalf("done-since should parse as unix time, got %+v", panes)
 	}
 	// Unset and garbage both read as zero — badge simply not armed.
 	for _, raw := range []string{"", "notanumber"} {
-		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 		if len(panes) != 1 || !panes[0].DoneSince.IsZero() {
 			t.Fatalf("done-since %q should yield zero time, got %+v", raw, panes)
 		}
@@ -58,7 +59,7 @@ func TestParsePanesDoneSince(t *testing.T) {
 
 func TestParsePanesSkipsMalformed(t *testing.T) {
 	out := "garbage line with no separators\n" +
-		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
+		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
 		"\n"
 	panes := parsePanes(out)
 	if len(panes) != 1 || panes[0].Session != "ok" {
@@ -67,7 +68,7 @@ func TestParsePanesSkipsMalformed(t *testing.T) {
 }
 
 func TestParsePanesBadTimestamp(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].Created.IsZero() {
 		t.Fatalf("bad timestamp should yield zero time, got %+v", panes)
 	}
@@ -76,7 +77,7 @@ func TestParsePanesBadTimestamp(t *testing.T) {
 // An unreadable pid reads as 0 — pane_pid isn't joined on for status
 // anymore, so this is just a parse-safety check, not a fallback trigger.
 func TestParsePanesBadPID(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || panes[0].PID != 0 {
 		t.Fatalf("bad pid should yield 0, got %+v", panes)
 	}
@@ -88,7 +89,7 @@ func TestParsePanesBadPID(t *testing.T) {
 func TestParsePanesEscapedSeparator(t *testing.T) {
 	// Field order is paneFormat's; the trailing user options are unset.
 	line := func(f ...string) string {
-		return strings.Join(append(f, make([]string, 22-len(f))...), `\037`)
+		return strings.Join(append(f, make([]string, paneFields-len(f))...), `\037`)
 	}
 	out := line("roost", "%0", "795186", "✻ coop", "0", "coop",
 		"1753279140", "/home/user/coop", "1") + "\n" +
@@ -205,7 +206,7 @@ func TestParsePanesClaudeOptions(t *testing.T) {
 	base := []string{
 		"alpha", "%1", "42", "✳ Claude Code", "0", "claude",
 		"1753900000", "/home/user/alpha",
-		"", "", "", "", "", "", "", "", "", "",
+		"", "", "", "", "", "", "",
 	}
 	published := strings.Join(append(append([]string{}, base...),
 		"waiting", "1753900100", "sess-1", "/home/user/alpha"), "\x1f")
@@ -234,7 +235,7 @@ func TestParsePanesClaudeOptions(t *testing.T) {
 func TestParsePanesClaudeOptionsEscaped(t *testing.T) {
 	fields := []string{
 		"alpha", "%1", "42", "t", "0", "claude", "1753900000", "/home/user/alpha",
-		"", "", "", "", "", "", "", "", "", "",
+		"", "", "", "", "", "", "",
 		"busy", "1753900100", "sess-1", "/home/user/alpha",
 	}
 	panes := parsePanes(strings.Join(fields, `\037`)) // tmux ≤ 3.4 vis(3) form
@@ -243,22 +244,62 @@ func TestParsePanesClaudeOptionsEscaped(t *testing.T) {
 	}
 }
 
+// The episode markers are the only arbiter state on a pane: the mode is
+// a global option read with an explicit show -gv, never through this
+// format.
 func TestParsePanesArbiterFields(t *testing.T) {
-	line := "arbiter\x1f%9\x1f42\x1ftitle\x1f0\x1fclaude\x1f1700000000\x1f/home/user/.config/coop/arbiter\x1f\x1f\x1f\x1f" +
-		"\x1f1\x1ffull\x1f1\x1fasking to run tests\x1f1\x1f1|1700000100|approved tests\x1f\x1f\x1f\x1f"
+	line := "alpha\x1f%9\x1f42\x1ftitle\x1f0\x1fclaude\x1f1700000000\x1f/home/user/alpha\x1f\x1f\x1f\x1f" +
+		"\x1fasking to run tests\x1f1\x1f1|1700000100|approved tests\x1f\x1f\x1f\x1f"
 	panes := parsePanes(line)
 	if len(panes) != 1 {
 		t.Fatalf("got %d panes, want 1", len(panes))
 	}
 	p := panes[0]
-	if !p.Arbiter || p.ArbiterMode != "full" || !p.ArbiterNudgedMark {
-		t.Errorf("arbiter fields = %v %q %v, want true full true",
-			p.Arbiter, p.ArbiterMode, p.ArbiterNudgedMark)
-	}
 	if p.ArbiterNote != "asking to run tests" || p.ArbiterSuggest != "1" {
 		t.Errorf("note = %q, suggest = %q", p.ArbiterNote, p.ArbiterSuggest)
 	}
 	if p.ArbiterLast != "1|1700000100|approved tests" {
 		t.Errorf("last = %q", p.ArbiterLast)
+	}
+}
+
+func TestFakeTmuxGlobalOptions(t *testing.T) {
+	f := &fakeTmux{}
+
+	// Set and read back
+	if err := f.SetGlobalOption("test_key", "test_value"); err != nil {
+		t.Fatalf("SetGlobalOption: %v", err)
+	}
+	got, err := f.GlobalOption("test_key")
+	if err != nil {
+		t.Fatalf("GlobalOption: %v", err)
+	}
+	if got != "test_value" {
+		t.Errorf("GlobalOption got %q, want %q", got, "test_value")
+	}
+
+	// Unset
+	if err := f.UnsetGlobalOption("test_key"); err != nil {
+		t.Fatalf("UnsetGlobalOption: %v", err)
+	}
+	got, err = f.GlobalOption("test_key")
+	if err != nil {
+		t.Fatalf("GlobalOption after unset: %v", err)
+	}
+	if got != "" {
+		t.Errorf("GlobalOption after unset got %q, want empty string", got)
+	}
+
+	// Error handling
+	f.err = errors.New("test error")
+	if err := f.SetGlobalOption("key", "val"); err == nil {
+		t.Error("SetGlobalOption should return error when f.err is set")
+	}
+	if err := f.UnsetGlobalOption("key"); err == nil {
+		t.Error("UnsetGlobalOption should return error when f.err is set")
+	}
+	_, err = f.GlobalOption("key")
+	if err == nil {
+		t.Error("GlobalOption should return error when f.err is set")
 	}
 }

@@ -70,7 +70,7 @@ starts. You can also fill the list in by hand:
 | `Backspace` | pass backspace to the selected session (erase a stray digit) |
 | `/` | start a slash command in the selected session (types `/` there, then focuses the live view) |
 | `n` | create a new session (repo picker; its last row adds a repo to the config) |
-| `a` | cycle the arbiter: off → recommend → full → off (turning off confirms like `x`) |
+| `a` | cycle the arbiter: off → recommend → full → off |
 | `x` | kill the selected session (`y` confirms, `esc` cancels) |
 | `q` | quit (`y` quits, `k` kills all sessions & quits, `esc` cancels; `ctrl+c` quits immediately). `k` asks again if sessions are still working. |
 | `?` | toggle the full key list in the footer |
@@ -88,24 +88,26 @@ deterministic settings should eat the truly routine prompts, and the
 arbiter is for the genuinely ambiguous residue that's left over, not a
 substitute for `settings.json`.
 
-Press `a` to cycle a real `claude --model sonnet` session — named
-`arbiter`, visible in the list like any other session, selectable and
-killable — through **off → recommend → full → off**:
+Press `a` to cycle the arbiter through **off → recommend → full → off**.
+It isn't a session you can see: when a session stops for input, coop runs
+one short-lived headless `claude` in the background for that dialog alone
+and applies what it decides.
 
-- `recommend` starts the arbiter but it only annotates a dialog with a
-  suggestion, never answers it.
+- `recommend` only annotates a dialog with a suggestion, never answers it.
 - `full` lets it answer numbered dialogs (a single digit) under policy.
   Free-text prompts always get triage only — the arbiter never types
   prose into a session.
-- Cycling back to off kills the arbiter session behind the same confirm
-  `x` uses (`y` confirms, `esc` cancels).
+- Cycling back to off takes effect at once, with no confirm — there's no
+  session to kill.
 
 Its judgment comes from `~/.config/coop/arbiter.md`, a freeform markdown
-policy file seeded on first launch with a conservative template (escalate
+policy file seeded on first use with a conservative template (escalate
 unless clearly routine; never approve pushes, deletes, installs, or
-anything irreversible). The arbiter is stateless between episodes, so
-edits only take effect on restart — kill it (`a`, `y`) and press `a`
-again.
+anything irreversible). Every dialog gets a fresh process that re-reads
+the file, so an edit takes effect on the next one — no restart.
+
+Turning the arbiter on doesn't reach backwards: sessions already sitting
+at a prompt when you press `a` stay untriaged until their next dialog.
 
 When it escalates, the selected session's row gets a marker and a
 one-line detail underneath it — `arbiter: <note>` — until the session
@@ -122,23 +124,52 @@ answer.
 
 Every action, answered or escalated, is appended to
 `~/.local/state/coop/arbiter-audit.jsonl` — a durable record coop itself
-never reads.
+never reads. Failures and anything the model returned that coop couldn't
+use land in `~/.local/state/coop/judge.log` beside it.
 
-The arbiter's only hands are a helper CLI, also usable by you:
-`coop peek <session>` (read the dialog and last transcript turn),
-`coop answer <session> <digit> <reason...>` (send a digit and audit it),
-`coop note [-suggest N] <session> <text...>` (leave an escalation note,
-optionally naming the digit `Space` applies). `answer` is
-the only write path, and it's gated server-side regardless of what the
-model attempts: it refuses coop's own sessions and the arbiter itself, a
-pane whose current command isn't in the allowlist, a screen not
-currently showing a dialog, and any attempt in `recommend` mode.
-`-suggest` is not one of those gates — nothing is sent until you press
-the key — so it is an ordinary flag. The
-helper CLI otherwise takes only `-socket`; the audit path and allowlist come from
-the environment (`XDG_STATE_HOME`, `COOP_ALLOWED_CMDS` — the arbiter
-session inherits the hub's `-allowed-cmds` value), never from flags the
-model could pass itself.
+The arbiter has no hands and no CLI to reach for: it runs with an empty
+tool set (`--tools ""`), so "it only reads a screen and answers" is
+enforced on the command line rather than left to a settings file. It
+returns a small JSON verdict — answer this digit, or escalate with this
+reason — and coop applies it behind gates it re-checks itself: coop's own
+sessions are refused, so is a pane whose current command isn't in the
+allowlist, a screen not currently showing a dialog, and any answer at all
+in `recommend` mode. The verdict names no pane either — it is applied to
+the exact pane that was judged, and only while that pane is still on the
+*same* dialog the judge looked at. Answer a prompt yourself while a
+judgement is in flight and its digit is dropped, not delivered to
+whatever opened next.
+
+Those gates are yours, so coop reads them only from your files: the
+allowlist is `arbiter.allowed_cmds` in `config.json` (an empty list means
+"send nothing"), the policy is `~/.config/coop/arbiter.md`, and the judge
+runs with a constructed environment — a `PATH` built from where coop
+itself is installed plus the system directories, a `HOME` from the
+password database, and nothing else through except locale, timezone and
+`TMUX_TMPDIR` (it has to find the same tmux server you're on). Its audit
+log always lands under `~/.local/state/coop`, wherever `XDG_STATE_HOME`
+points, so a redirected variable can't silence the record.
+A judge is spawned from inside the session it is about to judge, so
+anything that session can set — its environment, or an option on coop's
+tmux socket — is treated as untrusted and replaced.
+
+**This is defence in depth, not a sandbox.** coop and the sessions it
+watches run as the same user on the same tmux server, so a session that
+has already been talked into running arbitrary commands can turn the
+arbiter on, write to your config, or replace the coop binary; nothing
+in-band can stop that. What the gates do buy is that an unattended judge
+misfiring — a stale screen, a dead session's shell, a verdict about a
+dialog you already answered — doesn't turn into a keystroke, and that
+every answer it does send is on the record. Keep your per-repo Claude
+Code permissions tight; the arbiter is not a substitute for them.
+
+If your Anthropic auth lives in environment variables, put it in
+`~/.claude/settings.json`'s `env` block instead — the judge does not
+inherit `ANTHROPIC_*` from anywhere.
+
+`coop peek <session>` survives as a debug aid for you: it prints a
+session's screen and its last assistant turn, the same context the
+arbiter is handed.
 
 ## Config
 
@@ -147,7 +178,8 @@ model could pass itself.
 | `-socket` | `COOP_SOCKET` | `coop` | tmux socket name (`tmux -L`) |
 | `-allowed-cmds` | `COOP_ALLOWED_CMDS` | `claude,node` | commands quick-send may target |
 | `-done-ttl` | `COOP_DONE_TTL` | `5m` | how long a finished session shows `done` before decaying to idle (`0` disables) |
-| `arbiter.model` (config.json) | — | `sonnet` | model the arbiter session runs (`claude --model <model>`) |
+| `arbiter.model` (config.json) | — | `haiku` | model each triage episode runs (`claude -p --model <model>`) |
+| `arbiter.allowed_cmds` (config.json) | — | `["claude", "node"]` | commands a judge's answer may target (`[]` = never send) |
 
 `~/.config/coop/config.json` holds the repo list for the `n` picker and,
 optionally, tmux overrides (see below). The picker's `+ add new repo` row
@@ -157,7 +189,7 @@ appends to `repos`; anything else in the file is left as you wrote it:
 {
   "repos": ["~/proj/foo"],
   "tmux": ["set -g history-limit 100000", "set -g mouse off"],
-  "arbiter": {"model": "sonnet"}
+  "arbiter": {"model": "haiku", "allowed_cmds": ["claude", "node"]}
 }
 ```
 
