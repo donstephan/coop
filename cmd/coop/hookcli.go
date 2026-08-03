@@ -52,5 +52,8 @@ func runHookCLI(stdin io.Reader, getenv func(string) string) int {
 	// Best-effort: a failed write is one stale status; the next event
 	// or the SessionEnd unset corrects it.
 	_ = hub.ApplyHook(tm, pane, p, time.Now())
+	// The nudge shares the event's process: fires once per dialog, needs
+	// no hub attached, and carries the payload's substance.
+	hub.HookNudge(tm, pane, p, time.Now())
 	return 0
 }

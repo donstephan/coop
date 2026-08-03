@@ -31,8 +31,23 @@ go build -o /tmp/coop-e2e ./cmd/coop
 # what wait_for finds in the list.
 mkdir -p "$TMPD/stub" "$TMPD/zstub"
 tmux -L "$SOCKET" new-session -d -s stub -c "$TMPD/stub" \
-  "sleep 1; printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n\a'; printf '{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"stub\",\"cwd\":\"$TMPD/stub\"}' | /tmp/coop-e2e hook; sleep 300"
+  "sleep 3; printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n\a'; printf '{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"stub\",\"cwd\":\"$TMPD/stub\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rm -rf build/\"}}' | /tmp/coop-e2e hook; sleep 300"
 tmux -L "$SOCKET" set -g monitor-bell on
+
+# Fake arbiter: a read-echo loop, so the nudge coop hook types at it
+# lands as a visible GOT: line we can assert on. Created before the
+# stub's hook fires (the stub sleeps first) so the 1s readiness age
+# gate has passed by then.
+# Named "arbiter" (recommend mode) deliberately, not "arb": it coexists
+# with the "arb" session created later for the answer-gate assertions
+# (full mode), and FindArbiter takes the first match in tmux's listing
+# order — "arb" sorts before "arbiter", so the answer test still finds
+# its own full-mode session rather than this recommend-mode one. Do not
+# rename either session without checking that ordering still holds.
+mkdir -p "$TMPD/arb"
+tmux -L "$SOCKET" new-session -d -s arbiter -c "$TMPD/arb" \
+  'while IFS= read -r l; do echo "GOT:$l"; done'
+tmux -L "$SOCKET" set -t arbiter: @coop_arbiter 1
 
 # The hub TUI in its own session on the same socket.
 tmux -L "$SOCKET" new-session -d -s hub -x 100 -y 30 \
@@ -92,6 +107,11 @@ wait_for "stub" "$nav"
 wait_for_title "NEEDS INPUT" "$live"
 wait_for "1. Yes" "$live"      # nested client renders the stub's screen
 echo "ok: discovery, status, live preview"
+
+# The stub's hook invocation must also have nudged the arbiter, with
+# the payload's tool detail in the line.
+wait_for 'mode: recommend; trigger: Bash: rm -rf build/' arbiter
+echo "ok: hook nudged the arbiter with tool detail"
 
 # A second session; selecting it must retarget the live pane.
 tmux -L "$SOCKET" new-session -d -s zstub -c "$TMPD/zstub" "sleep 300"

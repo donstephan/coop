@@ -70,7 +70,6 @@ type Pane struct {
 
 	Arbiter           bool   // @coop_arbiter — the arbiter's own session
 	ArbiterMode       string // @coop_arbiter_mode — "" off the arbiter session
-	ArbiterSeen       bool   // @coop_arbiter_seen — survived a poll, safe to type at
 	ArbiterNudgedMark bool   // @coop_arbiter_nudged
 	ArbiterNote       string // @coop_arbiter_note — "" when none
 	ArbiterSuggest    string // @coop_arbiter_suggest — digit the note suggests, "" when none
@@ -128,13 +127,12 @@ const (
 	DoneSinceMarker = "@coop_done_since"
 	NotifiedMarker  = "@coop_notified"
 
-	// Arbiter state. The first three live on the arbiter's own session
+	// Arbiter state. The first two live on the arbiter's own session
 	// (readable from its panes via format inheritance, like HubMarker);
 	// the rest live on the tracked panes, same lifetime rules as the
 	// done/notify markers above.
 	ArbiterMarker       = "@coop_arbiter"        // "1" on the arbiter session
 	ArbiterModeMarker   = "@coop_arbiter_mode"   // "recommend" | "full"
-	ArbiterSeenMarker   = "@coop_arbiter_seen"   // arbiter outlived a poll (see ArbiterNudger)
 	ArbiterNudgedMarker = "@coop_arbiter_nudged" // this needs-input episode was nudged
 	ArbiterNoteMarker   = "@coop_arbiter_note"   // escalation note shown on the row
 	// ArbiterSuggestMarker is the digit that note's -suggest named, kept
@@ -155,7 +153,7 @@ const (
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterSeenMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterMarker + "}\x1f#{" + ArbiterModeMarker + "}\x1f#{" + ArbiterNudgedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
 
 // escapedSep is what tmux ≤ 3.4 prints instead of the \x1f separator:
 // those versions run -F output through vis(3), so every non-printable
@@ -189,7 +187,7 @@ func parsePanes(out string) []Pane {
 	var panes []Pane
 	for _, line := range strings.Split(out, "\n") {
 		f := splitFields(line)
-		if len(f) != 23 {
+		if len(f) != 22 {
 			continue
 		}
 		pid, _ := strconv.Atoi(f[2]) // unreadable pid just reads as 0 — nothing joins on it
@@ -198,13 +196,13 @@ func parsePanes(out string) []Pane {
 			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
 			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
 			NotifiedMark: f[11] == "1",
-			Arbiter:      f[12] == "1", ArbiterMode: f[13], ArbiterSeen: f[14] == "1",
-			ArbiterNudgedMark: f[15] == "1", ArbiterNote: f[16],
-			ArbiterSuggest: f[17], ArbiterLast: f[18],
+			Arbiter:      f[12] == "1", ArbiterMode: f[13],
+			ArbiterNudgedMark: f[14] == "1", ArbiterNote: f[15],
+			ArbiterSuggest: f[16], ArbiterLast: f[17],
 		}
-		if f[19] != "" {
-			p.Claude = &ClaudeState{Status: f[19], StatusSince: unixTime(f[20]),
-				SessionID: f[21], CWD: f[22]}
+		if f[18] != "" {
+			p.Claude = &ClaudeState{Status: f[18], StatusSince: unixTime(f[19]),
+				SessionID: f[20], CWD: f[21]}
 		}
 		panes = append(panes, p)
 	}

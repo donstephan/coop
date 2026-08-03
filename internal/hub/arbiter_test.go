@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,9 +36,110 @@ func TestArbiterModeOf(t *testing.T) {
 }
 
 func TestNudgeText(t *testing.T) {
-	got := NudgeText("sprocket-v2", "recommend")
+	got := NudgeText("sprocket-v2", "recommend", "")
 	if !strings.Contains(got, `"sprocket-v2"`) || !strings.Contains(got, "recommend") {
 		t.Errorf("NudgeText = %q", got)
+	}
+}
+
+func TestNudgeTextDetail(t *testing.T) {
+	if got := NudgeText("alpha", "recommend", ""); got != `coop: session "alpha" needs input (mode: recommend)` {
+		t.Errorf("plain form changed: %q", got)
+	}
+	if got := NudgeText("alpha", "full", "Bash: npm test"); got != `coop: session "alpha" needs input (mode: full; trigger: Bash: npm test)` {
+		t.Errorf("detail form: %q", got)
+	}
+	// Control bytes and newlines in the detail are typed into a live
+	// claude pane — they must be flattened, and the whole line capped.
+	got := NudgeText("alpha", "full", "Bash: rm\n-rf \x1b[31m"+strings.Repeat("x", 400))
+	if strings.ContainsAny(got, "\n\x1b") {
+		t.Errorf("detail not sanitized: %q", got)
+	}
+	if n := len([]rune(got)); n > 220 {
+		t.Errorf("nudge line %d runes, want ≤220", n)
+	}
+}
+
+func TestCatchupNudge(t *testing.T) {
+	arb := Pane{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full"}
+	panes := []Pane{
+		// hook-published waiting, un-nudged: gets the catch-up
+		{Session: "alpha", ID: "%1", Claude: &ClaudeState{Status: "waiting"}},
+		// already nudged: skipped
+		{Session: "beta", ID: "%2", Claude: &ClaudeState{Status: "waiting"}, ArbiterNudgedMark: true},
+		// busy: skipped
+		{Session: "gamma", ID: "%3", Claude: &ClaudeState{Status: "busy"}},
+		// title-tier needs-input with no hook state: skipped — nothing
+		// would ever clear a marker set here
+		{Session: "delta", ID: "%4", Title: "🔔 pick one"},
+		arb,
+		{Session: "roost", ID: "%0", Hub: true},
+	}
+	f := &fakeTmux{}
+	CatchupNudge(f, panes, arb)
+	if len(f.sent) != 1 {
+		t.Fatalf("sent = %v, want exactly alpha's nudge", f.sent)
+	}
+	if want := `coop: session "alpha" needs input (mode: full)`; f.sent[0][0] != want {
+		t.Errorf("nudge = %q, want %q", f.sent[0][0], want)
+	}
+	if f.paneOpts["%1/"+ArbiterNudgedMarker] != "1" {
+		t.Error("alpha's marker not set")
+	}
+	if _, ok := f.paneOpts["%4/"+ArbiterNudgedMarker]; ok {
+		t.Error("title-tier pane acquired a marker")
+	}
+}
+
+// RetireStaleEpisodes is the non-hook counterpart to ApplyHook's
+// waiting-exit cleanup: it is the only thing that ever clears markers
+// on a pane with no hook state, so a stale suggest digit from a
+// long-closed dialog doesn't survive to be applied with space.
+func TestRetireStaleEpisodes(t *testing.T) {
+	panes := []Pane{
+		// idle, no hook state: every marker retires
+		{Session: "alpha", ID: "%1", Status: StatusIdle,
+			ArbiterNudgedMark: true, ArbiterNote: "old note", ArbiterSuggest: "2"},
+		// hook pane (Claude set): ApplyHook owns its cleanup, untouched here
+		{Session: "beta", ID: "%2", Status: StatusIdle, Claude: &ClaudeState{},
+			ArbiterNote: "still fresh"},
+		// non-hook but still needs-input (bell title, derived status):
+		// the episode isn't over yet
+		{Session: "gamma", ID: "%3", Status: StatusNeedsInput, Title: "🔔 pick one",
+			ArbiterNote: "asking something"},
+		// coop's own sessions are never targets
+		{Session: "roost", ID: "%0", Hub: true, ArbiterNote: "n/a"},
+		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterNote: "n/a"},
+	}
+	f := &fakeTmux{panes: panes}
+	for _, p := range panes {
+		if p.ArbiterNudgedMark {
+			f.SetPaneOption(p.ID, ArbiterNudgedMarker, "1")
+		}
+		if p.ArbiterNote != "" {
+			f.SetPaneOption(p.ID, ArbiterNoteMarker, p.ArbiterNote)
+		}
+		if p.ArbiterSuggest != "" {
+			f.SetPaneOption(p.ID, ArbiterSuggestMarker, p.ArbiterSuggest)
+		}
+	}
+	RetireStaleEpisodes(f, panes)
+	for _, m := range []string{ArbiterNudgedMarker, ArbiterNoteMarker, ArbiterSuggestMarker} {
+		if _, ok := f.paneOpts["%1/"+m]; ok {
+			t.Errorf("alpha's %s survived retirement", m)
+		}
+	}
+	if f.paneOpts["%2/"+ArbiterNoteMarker] != "still fresh" {
+		t.Error("hook pane's note was cleared by the non-hook path")
+	}
+	if f.paneOpts["%3/"+ArbiterNoteMarker] != "asking something" {
+		t.Error("still-waiting pane's note was cleared")
+	}
+	if f.paneOpts["%0/"+ArbiterNoteMarker] != "n/a" {
+		t.Error("hub pane's note was touched")
+	}
+	if f.paneOpts["%9/"+ArbiterNoteMarker] != "n/a" {
+		t.Error("arbiter pane's own note was touched")
 	}
 }
 
@@ -91,177 +191,6 @@ func TestSanitizeNote(t *testing.T) {
 	}
 	if strings.ContainsAny(sanitizeNote("x\x08y"), "\x08") {
 		t.Errorf("sanitizeNote left a backspace byte")
-	}
-}
-
-// hubs is the socket's hub-session list Apply takes; it names the same
-// session the nudgers below are built for, so they win the election.
-var hubs = []string{"roost"}
-
-func TestArbiterNudgerNudgesOncePerEpisode(t *testing.T) {
-	f := &fakeTmux{}
-	n := NewArbiterNudger(f, "roost")
-	panes := []Pane{
-		{Session: "alpha", ID: "%1", Status: StatusNeedsInput},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full",
-			ArbiterSeen: true, Status: StatusIdle},
-	}
-	n.Apply(panes, hubs)
-	if len(f.sent) != 1 {
-		t.Fatalf("sent %d messages, want 1", len(f.sent))
-	}
-	keys := f.sent[0]
-	if len(keys) != 2 || keys[1] != "Enter" {
-		t.Fatalf("sent %v, want [text Enter]", keys)
-	}
-	if want := NudgeText("alpha", "full"); keys[0] != want {
-		t.Errorf("nudge = %q, want %q", keys[0], want)
-	}
-	if f.paneOpts["%1/"+ArbiterNudgedMarker] != "1" {
-		t.Error("nudged marker not set")
-	}
-	// Second poll, marker now visible on the pane: no re-nudge.
-	panes[0].ArbiterNudgedMark = true
-	n.Apply(panes, hubs)
-	if len(f.sent) != 1 {
-		t.Errorf("re-nudged: %d messages", len(f.sent))
-	}
-}
-
-func TestArbiterNudgerClearsEpisodeState(t *testing.T) {
-	f := &fakeTmux{paneOpts: map[string]string{
-		"%1/" + ArbiterNudgedMarker:  "1",
-		"%1/" + ArbiterNoteMarker:    "asking something",
-		"%1/" + ArbiterSuggestMarker: "1",
-	}}
-	n := NewArbiterNudger(f, "roost")
-	n.Apply([]Pane{{Session: "alpha", ID: "%1", Status: StatusWorking,
-		ArbiterNudgedMark: true, ArbiterNote: "asking something",
-		ArbiterSuggest: "1"}}, hubs)
-	if _, ok := f.paneOpts["%1/"+ArbiterNudgedMarker]; ok {
-		t.Error("nudged marker survived leaving needs-input")
-	}
-	if _, ok := f.paneOpts["%1/"+ArbiterNoteMarker]; ok {
-		t.Error("note survived leaving needs-input")
-	}
-	if _, ok := f.paneOpts["%1/"+ArbiterSuggestMarker]; ok {
-		t.Error("suggestion survived leaving needs-input")
-	}
-}
-
-func TestArbiterNudgerNeedsArbiterAndSkipsIt(t *testing.T) {
-	// No arbiter session: needs-input panes are left alone entirely.
-	f := &fakeTmux{}
-	NewArbiterNudger(f, "roost").Apply([]Pane{{Session: "alpha", ID: "%1", Status: StatusNeedsInput}}, hubs)
-	if len(f.sent) != 0 || len(f.paneOpts) != 0 {
-		t.Error("nudged without an arbiter")
-	}
-	// The arbiter's own needs-input (its own permission prompt) is never
-	// nudged about — that would loop.
-	f = &fakeTmux{}
-	NewArbiterNudger(f, "roost").Apply([]Pane{
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterSeen: true, Status: StatusNeedsInput},
-	}, hubs)
-	if len(f.sent) != 0 {
-		t.Error("arbiter nudged about itself")
-	}
-	// nil tracker is a no-op, like the other trackers.
-	var nn *ArbiterNudger
-	nn.Apply([]Pane{{Session: "alpha", ID: "%1", Status: StatusNeedsInput}}, hubs)
-}
-
-func TestArbiterNudgerWaitsOneTickAfterLaunch(t *testing.T) {
-	// Keys typed at a just-launched claude land in its composer with the
-	// Enter swallowed, so the nudge is never submitted. The first poll to
-	// see the arbiter only marks it; nudging starts a tick later.
-	f := &fakeTmux{}
-	n := NewArbiterNudger(f, "roost")
-	panes := []Pane{
-		{Session: "alpha", ID: "%1", Status: StatusNeedsInput},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full", Status: StatusIdle},
-	}
-	n.Apply(panes, hubs)
-	if len(f.sent) != 0 {
-		t.Fatalf("nudged a just-launched arbiter: %v", f.sent)
-	}
-	if f.sessionOpts["arbiter/"+ArbiterSeenMarker] != "1" {
-		t.Fatal("seen marker not set on the first poll")
-	}
-	if _, ok := f.paneOpts["%1/"+ArbiterNudgedMarker]; ok {
-		t.Error("episode marked as nudged while the nudge was held back")
-	}
-	// Next poll, marker now readable off the arbiter's session.
-	panes[1].ArbiterSeen = true
-	n.Apply(panes, hubs)
-	if len(f.sent) != 1 {
-		t.Fatalf("sent %d messages on the second poll, want 1", len(f.sent))
-	}
-}
-
-func TestArbiterNudgerOnlyOneHubNudges(t *testing.T) {
-	// Two hubs polling the same second both see an unmarked pane, so
-	// set-before-send can't dedupe; the lexicographically first hub
-	// session nudges and the rest stay quiet.
-	panes := []Pane{
-		{Session: "alpha", ID: "%1", Status: StatusNeedsInput},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full",
-			ArbiterSeen: true, Status: StatusIdle},
-	}
-	both := []string{"roost-2", "roost"}
-	f := &fakeTmux{}
-	NewArbiterNudger(f, "roost-2").Apply(panes, both)
-	if len(f.sent) != 0 {
-		t.Errorf("follower hub nudged: %v", f.sent)
-	}
-	if _, ok := f.paneOpts["%1/"+ArbiterNudgedMarker]; ok {
-		t.Error("follower hub marked the episode")
-	}
-	f = &fakeTmux{}
-	NewArbiterNudger(f, "roost").Apply(panes, both)
-	if len(f.sent) != 1 {
-		t.Errorf("leader hub sent %d messages, want 1", len(f.sent))
-	}
-	// A hub whose own session carries no @coop marker still nudges —
-	// better a duplicate than a socket where nobody nudges.
-	f = &fakeTmux{}
-	NewArbiterNudger(f, "roost").Apply(panes, nil)
-	if len(f.sent) != 1 {
-		t.Errorf("unmarked hub sent %d messages, want 1", len(f.sent))
-	}
-}
-
-func TestArbiterNudgerUnmarksOnFailedSend(t *testing.T) {
-	f := &fakeTmux{sendErr: errors.New("send failed")}
-	n := NewArbiterNudger(f, "roost")
-	panes := []Pane{
-		{Session: "alpha", ID: "%1", Status: StatusNeedsInput},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full",
-			ArbiterSeen: true, Status: StatusIdle},
-	}
-	n.Apply(panes, hubs)
-	if _, ok := f.paneOpts["%1/"+ArbiterNudgedMarker]; ok {
-		t.Error("nudged marker survived a failed SendKeys")
-	}
-}
-
-func TestArbiterNudgerSkipsHubPanes(t *testing.T) {
-	// Defense in depth: the live preview pane's screen is whatever
-	// session it's previewing and can read needs-input, so the nudger
-	// itself must never nudge about a hub pane even if the tui's
-	// pre-filter somehow let one through.
-	f := &fakeTmux{}
-	n := NewArbiterNudger(f, "roost")
-	panes := []Pane{
-		{Session: "roost", ID: "%0", Hub: true, Status: StatusNeedsInput},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "full",
-			ArbiterSeen: true, Status: StatusIdle},
-	}
-	n.Apply(panes, hubs)
-	if len(f.sent) != 0 {
-		t.Error("nudged about a hub pane")
-	}
-	if _, ok := f.paneOpts["%0/"+ArbiterNudgedMarker]; ok {
-		t.Error("marked a hub pane")
 	}
 }
 

@@ -29,12 +29,16 @@ type pollMsg struct {
 	hubs     []string // sessions marked @coop — every hub instance's own
 	liveGone bool
 	title    string // live pane title set during the poll; "" if none
+	caughtUp bool   // the arbiter launch catch-up ran this poll
 	err      error
 }
 
 type focusedMsg struct{ err error }
 type sentMsg struct{ err error }
-type createdMsg struct{ err error }
+type createdMsg struct {
+	err     error
+	arbiter bool // true when this createdMsg came from arbiterCreateCmd
+}
 type killedMsg struct{ err error }
 
 type livePaneMsg struct {
@@ -65,7 +69,6 @@ type Model struct {
 	socket     string
 	done       *hub.DoneTracker
 	notify     *hub.NotifyTracker
-	nudge      *hub.ArbiterNudger
 	// transcripts reads session transcripts for the stat column; a field
 	// rather than a concrete type so tests can substitute one.
 	transcripts func(sessionID, cwd string) (hub.TranscriptStats, bool)
@@ -109,6 +112,8 @@ type Model struct {
 	// resolved to; nil when there is no config to write.
 	addRepo func(repo string) (string, error)
 	arb     ArbiterConfig
+	// arbiterCatchup: a just-launched arbiter owes already-waiting panes a one-shot catch-up nudge
+	arbiterCatchup bool
 
 	width, height int
 }
@@ -127,7 +132,7 @@ func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
 	return Model{tmux: tm, allowed: allowed, hubSession: hubSession,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
 		loadRepos: loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
-		notify: hub.NewNotifyTracker(tm), nudge: hub.NewArbiterNudger(tm, hubSession),
+		notify:      hub.NewNotifyTracker(tm),
 		transcripts: hub.DefaultTranscripts().Stats,
 		arb:         arb,
 		focused:     true, width: 80, height: 24}
@@ -152,7 +157,7 @@ func tick() tea.Cmd {
 func (m Model) poll() tea.Cmd {
 	tm, hubSession, live := m.tmux, m.hubSession, m.livePane
 	done, notify, liveTarget := m.done, m.notify, m.liveTarget
-	nudge := m.nudge
+	catchup := m.arbiterCatchup
 	transcripts := m.transcripts
 	if m.statCol == statColOff {
 		transcripts = nil // nobody is looking; don't touch the filesystem
@@ -179,7 +184,22 @@ func (m Model) poll() tea.Cmd {
 		for _, p := range notify.Apply(panes) {
 			hub.NotifySend(p.Session, cleanTitle(p.Title))
 		}
-		nudge.Apply(panes, hubs)
+		// Retire stale episode markers on panes that have no hook state
+		// to clear them itself (hand-started sessions, -hooks=false) —
+		// needs derived statuses, so it runs here rather than in Update.
+		hub.RetireStaleEpisodes(tm, panes)
+		caughtUp := false
+		if catchup {
+			// The launch catch-up runs here in the poll closure — same
+			// place the old nudger lived — because the pollMsg handler's
+			// single command is already spoken for (retarget). Gated on
+			// the same readiness age as HookNudge; until the arbiter is
+			// old enough the flag just rides to the next tick.
+			if arb, ok := hub.FindArbiter(panes); ok && hub.ArbiterReady(arb, time.Now()) {
+				hub.CatchupNudge(tm, panes, arb)
+				caughtUp = true
+			}
+		}
 		done.Apply(panes, visitedFunc(tm, hubSession, live, liveTarget), time.Now())
 		hub.SortPanes(panes)
 		liveGone := live != "" && !paneExists(all, live)
@@ -191,7 +211,7 @@ func (m Model) poll() tea.Cmd {
 				}
 			}
 		}
-		return pollMsg{panes: panes, hubs: hubs, liveGone: liveGone, title: title}
+		return pollMsg{panes: panes, hubs: hubs, liveGone: liveGone, title: title, caughtUp: caughtUp}
 	}
 }
 
@@ -515,6 +535,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.title != "" {
 			m.liveTitle = msg.title
 		}
+		if msg.caughtUp {
+			m.arbiterCatchup = false
+		}
 		m.selectedID = pickPane(m.panes, m.selectedID)
 		if m.confirmKill != "" && !m.hasSession(m.confirmKill) {
 			m.confirmKill = "" // armed session died on its own
@@ -619,6 +642,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.actionErr = "create: " + msg.err.Error()
 			m.pendingSession = ""
+			if msg.arbiter {
+				m.arbiterCatchup = false // launch failed; nothing to catch up
+			}
 			return m, nil
 		}
 		// Poll now instead of waiting out the tick — the new session
@@ -950,6 +976,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.actionErr = "arbiter: no config dir"
 			return m, nil
 		}
+		m.arbiterCatchup = true
 		return m, m.arbiterCreateCmd()
 	case " ":
 		// Apply the arbiter's suggestion: the same send the digit key
@@ -1137,7 +1164,7 @@ func (m Model) arbiterCreateCmd() tea.Cmd {
 		if model == "" {
 			model = "sonnet"
 		}
-		return createdMsg{err: hub.LaunchArbiter(tm, arb.ConfigDir, allowed, claudeCmd, model, w, h)}
+		return createdMsg{err: hub.LaunchArbiter(tm, arb.ConfigDir, allowed, claudeCmd, model, w, h), arbiter: true}
 	}
 }
 

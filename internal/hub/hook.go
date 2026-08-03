@@ -16,6 +16,14 @@ type HookPayload struct {
 	CWD              string `json:"cwd"`
 	Source           string `json:"source"`
 	NotificationType string `json:"notification_type"`
+
+	// PermissionRequest extras — what the dialog is about, so a nudge
+	// can carry the substance and spare the arbiter a peek round-trip.
+	ToolName       string `json:"tool_name"`
+	PermissionRule string `json:"permission_rule"`
+	ToolInput      struct {
+		Command string `json:"command"`
+	} `json:"tool_input"`
 }
 
 // ParseHookPayload decodes one hook invocation's stdin. false for
@@ -101,6 +109,16 @@ func ApplyHook(tm Tmux, pane string, p HookPayload, now time.Time) error {
 	if err := tm.SetPaneOption(pane, ClaudeStatusMarker, status); err != nil {
 		return err
 	}
+	// Leaving waiting ends the needs-input episode: retire the nudge
+	// dedupe and any note/suggestion the arbiter parked on the row —
+	// cleanup that once ran from the hub poll, now owned by the hook.
+	// Best-effort blind unsets (set -pu on an absent option is fine);
+	// a miss self-heals when the pane dies.
+	if status != "waiting" {
+		for _, m := range []string{ArbiterNudgedMarker, ArbiterNoteMarker, ArbiterSuggestMarker} {
+			tm.UnsetPaneOption(pane, m)
+		}
+	}
 	// Identity rides along on every status change too, not just
 	// SessionStart: every payload carries session_id/cwd, so if the
 	// one-shot SessionStart write failed, the pane's identity (stat
@@ -118,4 +136,58 @@ func ApplyHook(tm Tmux, pane string, p HookPayload, now time.Time) error {
 	}
 	return tm.SetPaneOption(pane, ClaudeSinceMarker,
 		strconv.FormatInt(now.Unix(), 10))
+}
+
+// arbiterReadyAge gates typing at a freshly launched arbiter. Keys
+// typed at a claude younger than about half a second land in its
+// composer with the trailing Enter absorbed (measured on 2.1.220:
+// sends at 0.45s stick, at 0.5s go through); one second is twice that.
+// This replaces the deleted @coop_arbiter_seen poll-tick gate.
+const arbiterReadyAge = time.Second
+
+// ArbiterReady reports whether the arbiter is old enough to type at.
+// session_created is whole-second truncated, so the measured age
+// overshoots the real age by up to a second — the extra second here
+// buys back that error, keeping the real floor at arbiterReadyAge.
+func ArbiterReady(arb Pane, now time.Time) bool {
+	return now.Sub(arb.Created) >= arbiterReadyAge+time.Second
+}
+
+// HookNudge tells the arbiter this pane just entered needs-input. It
+// runs inside coop hook, so the event itself is the dedupe unit — no
+// leader election, no hub required; nudges keep flowing with every TUI
+// detached. Entirely best-effort and silent, like the rest of the hook
+// path: any miss here is a nudge the operator's own eyes still cover
+// via the NEEDS INPUT row.
+func HookNudge(tm Tmux, selfPane string, p HookPayload, now time.Time) {
+	if status, _, _ := hookAction(p); status != "waiting" {
+		return
+	}
+	panes, err := tm.ListSessions()
+	if err != nil {
+		return
+	}
+	arb, ok := FindArbiter(panes)
+	// A skipped nudge must not set the marker: the launch catch-up is
+	// what retries panes that went waiting before the arbiter was ready,
+	// and it only looks at un-nudged panes.
+	if !ok || !ArbiterReady(arb, now) {
+		return
+	}
+	var self *Pane
+	for i := range panes {
+		if panes[i].ID == selfPane {
+			self = &panes[i]
+			break
+		}
+	}
+	if self == nil || self.Arbiter || self.Hub || self.ArbiterNudgedMark {
+		return
+	}
+	tm.SetPaneOption(selfPane, ArbiterNudgedMarker, "1")
+	if err := tm.SendKeys(arb.ID,
+		NudgeText(self.Session, ArbiterModeOf(arb), NudgeDetail(p)), "Enter"); err != nil {
+		// Re-arm so a later arbiter relaunch's catch-up can retry.
+		tm.UnsetPaneOption(selfPane, ArbiterNudgedMarker)
+	}
 }

@@ -2528,6 +2528,37 @@ func TestArbiterKeyCycle(t *testing.T) {
 	}
 }
 
+// The a key arms the one-shot catch-up the moment it launches the
+// arbiter, before the create even lands — poll must not skip a nudge
+// window while createdMsg is still in flight. A failed launch then
+// clears the flag: there is no arbiter to run a catch-up against.
+func TestArbiterLaunchSetsCatchup(t *testing.T) {
+	f := &fakeTmux{}
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0,
+		ArbiterConfig{Model: "sonnet", ConfigDir: t.TempDir()})
+
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = mm.(Model)
+	if !m.arbiterCatchup {
+		t.Fatal("a with no arbiter did not arm the catch-up flag")
+	}
+	if cmd == nil {
+		t.Fatal("a with no arbiter returned no command")
+	}
+
+	f.err = errors.New("launch failed")
+	msg := cmd()
+	created, ok := msg.(createdMsg)
+	if !ok || !created.arbiter || created.err == nil {
+		t.Fatalf("createdMsg = %#v", msg)
+	}
+	mm, _ = m.Update(created)
+	m = mm.(Model)
+	if m.arbiterCatchup {
+		t.Error("failed launch left the catch-up flag armed")
+	}
+}
+
 func TestArbiterFooterDetail(t *testing.T) {
 	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
@@ -2664,42 +2695,52 @@ func TestKillArbiterRowConfirmsByName(t *testing.T) {
 	}
 }
 
-func TestPollNudgesArbiter(t *testing.T) {
+// Launching the arbiter arms a one-shot catch-up: the first poll that
+// sees an old-enough arbiter nudges already-waiting hook panes, then
+// the flag clears.
+func TestArbiterLaunchCatchup(t *testing.T) {
 	f := &fakeTmux{panes: []hub.Pane{
-		{Session: "alpha", ID: "%1", Title: "🔔 pick one"},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "recommend",
-			ArbiterSeen: true},
+		{Session: "alpha", ID: "%1", Title: "✳ Claude Code",
+			Claude: &hub.ClaudeState{Status: "waiting"}},
+		{Session: "arbiter", ID: "%9", Arbiter: true,
+			Created: time.Now().Add(-5 * time.Second)},
 	}}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	if _, ok := m.poll()().(pollMsg); !ok {
-		t.Fatal("poll did not return a pollMsg")
+	m := pollOnce(t, f)
+	m.arbiterCatchup = true
+	m = drive(t, m, m.poll())
+	if m.arbiterCatchup {
+		t.Error("flag should clear once the catch-up ran")
 	}
 	found := false
 	for _, keys := range f.sent {
-		if len(keys) == 2 && keys[0] == hub.NudgeText("alpha", "recommend") {
+		if strings.Contains(keys[0], `session "alpha" needs input`) {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("no nudge sent; sent = %v", f.sent)
+		t.Errorf("no catch-up nudge in sent keys: %v", f.sent)
 	}
 }
 
-// A just-launched arbiter isn't typed at until it has survived a poll —
-// claude swallows the Enter on keys sent in its first half second.
-func TestPollHoldsNudgeUntilArbiterSettles(t *testing.T) {
+// A young arbiter defers the catch-up to a later tick instead of
+// typing into the key-swallow window.
+func TestArbiterLaunchCatchupWaitsForAge(t *testing.T) {
 	f := &fakeTmux{panes: []hub.Pane{
-		{Session: "alpha", ID: "%1", Title: "🔔 pick one"},
-		{Session: "arbiter", ID: "%9", Arbiter: true, ArbiterMode: "recommend"},
+		{Session: "alpha", ID: "%1", Title: "✳ Claude Code",
+			Claude: &hub.ClaudeState{Status: "waiting"}},
+		// Still under hub.ArbiterReady's floor (arbiterReadyAge + 1s, to
+		// absorb session_created's whole-second truncation) — plain
+		// time.Now() is well inside it.
+		{Session: "arbiter", ID: "%9", Arbiter: true, Created: time.Now()},
 	}}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0, ArbiterConfig{})
-	if _, ok := m.poll()().(pollMsg); !ok {
-		t.Fatal("poll did not return a pollMsg")
+	m := pollOnce(t, f)
+	m.arbiterCatchup = true
+	m = drive(t, m, m.poll())
+	if !m.arbiterCatchup {
+		t.Error("flag consumed before the arbiter was old enough")
 	}
-	for _, keys := range f.sent {
-		if len(keys) == 2 && keys[0] == hub.NudgeText("alpha", "recommend") {
-			t.Fatalf("nudged a just-launched arbiter: %v", f.sent)
-		}
+	if len(f.sent) != 0 {
+		t.Errorf("typed at a fresh arbiter: %v", f.sent)
 	}
 }
 
