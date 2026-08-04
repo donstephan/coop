@@ -91,10 +91,13 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x
 
 // NeedsInputScreen reports whether a pane's visible tail shows an open
 // Claude Code dialog (permission prompt, question menu, trust prompt).
-// Serves the arbiter's answer gate (Answer) — attached sessions never
-// latch tmux's bell flag and the pane title doesn't distinguish an open
-// dialog from idle, so the arbiter checks the actual screen before it
-// types a reply.
+// It is the judge log's second opinion on a capture: a verdict that
+// escalates with "cannot see the dialog" reads identically to a capture
+// that genuinely showed none, and neither the pane title nor tmux's bell
+// flag can tell those apart (an attached session never latches the bell,
+// and the title says nothing about an open dialog). Logging what this
+// saw of the same screen the model was handed is what makes the pair
+// distinguishable after the fact.
 func NeedsInputScreen(screen string) bool {
 	screen = ansiRe.ReplaceAllString(screen, "")
 	screen = strings.ReplaceAll(screen, " ", " ") // Claude pads the caret with NBSP
@@ -130,33 +133,8 @@ func SortPanes(panes []Pane) {
 }
 
 // StripANSI removes CSI and OSC escape sequences — capture-pane -e
-// output, for consumers that need plain text (coop peek, DialogLine).
+// output, for consumers that need plain text (coop peek, the screen a
+// judging episode is handed).
 func StripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
-}
-
-// numberedRow matches any dialog option row, selected ("❯ 1. Yes") or
-// not ("  2. No") — the lines DialogLine must walk past to find the
-// question above them.
-var numberedRow = regexp.MustCompile(`^\s*(❯\s*)?\d+\.\s`)
-
-// DialogLine returns the dialog's question — the nearest non-empty,
-// non-option line above the first selected option row — or "" when the
-// screen shows no dialog. Feeds the audit log's dialog excerpt.
-func DialogLine(screen string) string {
-	screen = StripANSI(screen)
-	screen = strings.ReplaceAll(screen, " ", " ") // Claude pads the caret with NBSP
-	lines := strings.Split(screen, "\n")
-	for i, l := range lines {
-		if !dialogOption.MatchString(l) {
-			continue
-		}
-		for j := i - 1; j >= 0; j-- {
-			if s := strings.TrimSpace(lines[j]); s != "" && !numberedRow.MatchString(lines[j]) {
-				return s
-			}
-		}
-		return ""
-	}
-	return ""
 }

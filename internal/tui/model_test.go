@@ -2501,8 +2501,7 @@ func TestArbiterKeyCycle(t *testing.T) {
 	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
 	for _, tc := range []struct{ from, want string }{
 		{hub.ArbiterModeOff, hub.ArbiterModeRecommend},
-		{hub.ArbiterModeRecommend, hub.ArbiterModeFull},
-		{hub.ArbiterModeFull, hub.ArbiterModeOff},
+		{hub.ArbiterModeRecommend, hub.ArbiterModeOff},
 	} {
 		m.arbiterMode = tc.from
 		next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
@@ -2541,20 +2540,20 @@ func TestArbiterKeyCycle(t *testing.T) {
 // and the first a keypress cycles from the wrong place.
 func TestPollCarriesArbiterModeIntoModel(t *testing.T) {
 	f := &fakeTmux{panes: testPanes(),
-		globals: map[string]string{hub.ArbiterModeMarker: hub.ArbiterModeFull}}
+		globals: map[string]string{hub.ArbiterModeMarker: hub.ArbiterModeRecommend}}
 	m := pollOnce(t, f)
-	if m.arbiterMode != hub.ArbiterModeFull {
-		t.Errorf("arbiterMode = %q, want %q", m.arbiterMode, hub.ArbiterModeFull)
+	if m.arbiterMode != hub.ArbiterModeRecommend {
+		t.Errorf("arbiterMode = %q, want %q", m.arbiterMode, hub.ArbiterModeRecommend)
 	}
-	if got := m.arbiterHint(); got != "a arbiter full" {
+	if got := m.arbiterHint(); got != "a arbiter recommend" {
 		t.Errorf("hint = %q", got)
 	}
 }
 
 func TestArbiterHintShowsMode(t *testing.T) {
 	m := New(&fakeTmux{}, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
-	m.arbiterMode = hub.ArbiterModeFull
-	if got := m.arbiterHint(); got != "a arbiter full" {
+	m.arbiterMode = hub.ArbiterModeRecommend
+	if got := m.arbiterHint(); got != "a arbiter recommend" {
 		t.Errorf("got %q", got)
 	}
 	m.arbiterMode = hub.ArbiterModeOff
@@ -2571,10 +2570,11 @@ func TestArbiterFooterDetail(t *testing.T) {
 	if foot := m.viewFooter(); !strings.Contains(foot, "asking to run tests") {
 		t.Errorf("footer = %q, want the note", foot)
 	}
+	// With the note retired there is nothing else to show: the arbiter
+	// cannot answer, so the row has no second arbiter line to fall back to.
 	m.panes[0].ArbiterNote = ""
-	m.panes[0].ArbiterLast = "1|1700000100|approved tests"
-	if foot := m.viewFooter(); !strings.Contains(foot, "answered 1 by arbiter") {
-		t.Errorf("footer = %q, want the answered line", foot)
+	if foot := m.viewFooter(); strings.Contains(foot, "arbiter:") {
+		t.Errorf("footer = %q, want no arbiter line", foot)
 	}
 }
 

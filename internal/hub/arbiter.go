@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -14,11 +12,11 @@ import (
 
 // The arbiter is a triage judge: one headless claude per needs-input
 // episode (see judge.go), whose verdict this package applies through
-// Answer/Note. The mode says how far a verdict may go.
+// Note. It never sends keystrokes — a verdict's digit is a suggestion
+// the human applies with space, and the mode is only on or off.
 const (
 	ArbiterModeOff       = "off"       // no judging at all
-	ArbiterModeRecommend = "recommend" // annotate only, never answer
-	ArbiterModeFull      = "full"      // may answer under policy
+	ArbiterModeRecommend = "recommend" // judge and annotate
 )
 
 // RetireStaleEpisodes clears episode markers (note, suggest) from panes
@@ -53,20 +51,17 @@ type GlobalReader interface {
 
 // ArbiterMode reads the socket-global arbiter mode. It lives on the
 // server's global option set rather than a session, because there is no
-// arbiter session any more: every hub on the socket and every judge
-// process coop hook spawns has to see the same value, and a judge runs
-// outside any hub. Anything but an explicit recommend/full — unset, a
-// read error, or a value a future version wrote — reads as off: the mode
-// that does nothing is the default, never the accident.
+// arbiter session: every hub on the socket and every judge process coop
+// hook spawns has to see the same value, and a judge runs outside any
+// hub. Anything but an explicit recommend — unset, a read error, the
+// "full" an older coop wrote, or a value a future version writes — reads
+// as off: the mode that does nothing is the default, never the accident.
 func ArbiterMode(tm GlobalReader) string {
 	v, err := tm.GlobalOption(ArbiterModeMarker)
 	if err != nil {
 		return ArbiterModeOff
 	}
-	switch v {
-	case ArbiterModeFull:
-		return ArbiterModeFull
-	case ArbiterModeRecommend:
+	if v == ArbiterModeRecommend {
 		return ArbiterModeRecommend
 	}
 	return ArbiterModeOff
@@ -75,26 +70,16 @@ func ArbiterMode(tm GlobalReader) string {
 // SetArbiterMode writes the mode, unsetting the option for off so a
 // disabled arbiter leaves no marker behind.
 func SetArbiterMode(tm Tmux, mode string) error {
-	if mode != ArbiterModeRecommend && mode != ArbiterModeFull {
+	if mode != ArbiterModeRecommend {
 		return tm.UnsetGlobalOption(ArbiterModeMarker)
 	}
 	return tm.SetGlobalOption(ArbiterModeMarker, mode)
 }
 
 // DefaultAllowedCmds is the built-in pane_current_command allowlist: the
-// hub flag's default, and what a judge falls back to when config.json
-// names none.
-//
-// A judge reads its allowlist (and everything else) from config.json at
-// config.DefaultPath(), never from tmux and never from the environment.
-// Both of those were tried and both are writable by the sessions the
-// gate exists to hold: coop hook runs inside the monitored pane, so its
-// environment is that session's to set, and every process in that pane
-// inherits a $TMUX pointing at coop's own socket, so `tmux set -g` is
-// one already-approved tool call away — strictly easier than exporting a
-// variable, which needs a restart to take. A file under the operator's
-// home is the only channel here that a monitored session cannot rewrite
-// through coop's own plumbing.
+// hub flag's default, gating the TUI's own digit keys and the space
+// suggestion-apply. The arbiter has no allowlist of its own any more — it
+// cannot send a key at all — so this is the only gate left of this shape.
 const DefaultAllowedCmds = "claude,node"
 
 // ArbiterSuggestOf returns the pane's applyable suggestion — a single
@@ -141,42 +126,13 @@ func NudgeDetail(p HookPayload) string {
 	return ""
 }
 
-// ArbiterLast is a parsed ArbiterLastMarker value — the arbiter's most
-// recent answer to this pane's dialogs.
-type ArbiterLast struct {
-	Digit  string
-	At     time.Time
-	Reason string
-}
-
-// FormatArbiterLast encodes an answer as "digit|unix|reason" for the
-// pane option. The reason is sanitized so the option value stays one
-// line and survives the poll's \x1f-separated format.
-func FormatArbiterLast(digit string, at time.Time, reason string) string {
-	return digit + "|" + strconv.FormatInt(at.Unix(), 10) + "|" + sanitizeNote(reason)
-}
-
-// ParseArbiterLast decodes FormatArbiterLast's value; false for ""
-// (option unset) or any shape a future version wrote.
-func ParseArbiterLast(s string) (ArbiterLast, bool) {
-	parts := strings.SplitN(s, "|", 3)
-	if len(parts) != 3 {
-		return ArbiterLast{}, false
-	}
-	n, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return ArbiterLast{}, false
-	}
-	return ArbiterLast{Digit: parts[0], At: time.Unix(n, 0), Reason: parts[2]}, true
-}
-
 // sanitizeNote flattens free text into a one-line tmux option value:
 // \x1f would break the poll's field format, newlines would break the
 // row, and noteMax bounds what one arbiter turn can park on a pane.
 // Every other non-whitespace control byte (C0 range and DEL) is
 // dropped too — this text is rendered verbatim by the TUI's reflow,
 // which passes ANSI escapes through, so an unescaped ESC/BEL is a
-// terminal-injection vector via coop note/answer reasons. Whitespace
+// terminal-injection vector via a note's reason. Whitespace
 // controls (\t, \n, ...) are left for Fields below to fold into a
 // single space, same as before.
 func sanitizeNote(s string) string {
@@ -193,30 +149,12 @@ func sanitizeNote(s string) string {
 	return s
 }
 
-// noteMax bounds a note or answer reason. The old 120 was one footer
+// noteMax bounds a note's reason. The old 120 was one footer
 // line's worth, back when the footer clipped at one line; the message
 // box wraps and scrolls, so the bound is now about keeping a runaway
 // turn from parking a wall of text on a pane — roughly three box-fulls
 // at nav width.
 const noteMax = 480
-
-// AnswerReq is one answer — the only write path from the arbiter to a
-// monitored session. PaneID, not a session name: a session whose window
-// is split has several panes sharing session_name, and the judge reasoned
-// about exactly one of them.
-type AnswerReq struct {
-	PaneID  string
-	Digit   string
-	Reason  string
-	Allowed []string // pane_current_command allowlist, same as the TUI's
-	Audit   string   // audit log path
-	Now     time.Time
-	// Since is the @coop_status_since of the episode the digit was
-	// decided for — the pane's identity for *this* dialog, re-read at
-	// send time. Zero skips the check, for callers with no episode to
-	// name (a pane publishing no hook state).
-	Since time.Time
-}
 
 var digitRe = regexp.MustCompile(`^[0-9]$`)
 
@@ -255,90 +193,11 @@ func findTarget(panes []Pane, session string) (Pane, error) {
 	return Pane{}, fmt.Errorf("no session %q on this socket", session)
 }
 
-// Answer sends one digit to a pane's open dialog, behind every gate the
-// spec names — checked here rather than at the caller, so no prompt
-// wording can bypass them. Refusal errors say why: applyVerdict reads the
-// error and escalates with it attached instead of retrying. The returned
-// warn covers post-send bookkeeping (marker, audit) that failed after the
-// digit already landed.
-func Answer(tm Tmux, req AnswerReq) (string, error) {
-	if !digitRe.MatchString(req.Digit) {
-		return "", fmt.Errorf("digit must be a single 0-9, got %q", req.Digit)
-	}
-	if strings.TrimSpace(req.Reason) == "" {
-		return "", fmt.Errorf("a reason is required")
-	}
-	panes, err := tm.ListSessions()
-	if err != nil {
-		return "", err
-	}
-	p, err := findPaneTarget(panes, req.PaneID)
-	if err != nil {
-		return "", err
-	}
-	if ArbiterMode(tm) != ArbiterModeFull {
-		return "", fmt.Errorf("arbiter is not in full mode — escalate with a note instead")
-	}
-	// Same allowed-cmds gate as the TUI's digit-send: a dead claude
-	// leaves a shell that must never receive keystrokes.
-	cmd, err := tm.PaneCommand(p.ID)
-	if err != nil {
-		return "", err
-	}
-	if !slices.Contains(req.Allowed, cmd) {
-		return "", fmt.Errorf("refusing to send: pane is running %q (allowed: %s)",
-			cmd, strings.Join(req.Allowed, ","))
-	}
-	screen, err := tm.CapturePane(p.ID)
-	if err != nil {
-		return "", err
-	}
-	if !NeedsInputScreen(screen) {
-		return "", fmt.Errorf("refusing to send: %q shows no open dialog", p.Session)
-	}
-	// NeedsInputScreen only says *a* numbered dialog is up, and a whole
-	// model turn sits between the screen the verdict was formed on and
-	// this send: the human can answer that dialog and claude can open an
-	// unrelated one in the meantime, into which the digit would land
-	// having been judged against nothing. @coop_status_since moves on
-	// every waiting→busy→waiting transition, so it names the episode;
-	// re-read here rather than trusting the pane list above, to keep the
-	// window as close to SendKeys as tmux allows. It is unix seconds, so
-	// a full round trip inside one second is indistinguishable — narrow,
-	// not impossible, and a refusal is only ever downgraded to a note.
-	if !req.Since.IsZero() {
-		since, err := tm.PaneOption(p.ID, ClaudeSinceMarker)
-		if err != nil {
-			return "", err
-		}
-		if !unixTime(since).Equal(req.Since) {
-			return "", fmt.Errorf("refusing to send: %q is on a different dialog now", p.Session)
-		}
-	}
-	if err := tm.SendKeys(p.ID, req.Digit); err != nil {
-		return "", err
-	}
-	// Marker and audit are best-effort — the digit already landed, so
-	// failures downgrade to warnings rather than a misleading non-zero.
-	var warns []string
-	if err := tm.SetPaneOption(p.ID, ArbiterLastMarker,
-		FormatArbiterLast(req.Digit, req.Now, req.Reason)); err != nil {
-		warns = append(warns, "marker: "+err.Error())
-	}
-	// The audit names the session, which is what a human recognises; the
-	// pane it actually went to is resolved above, never taken on trust.
-	if err := AppendAudit(req.Audit, AuditEntry{Time: req.Now, Session: p.Session,
-		Action: "answered", Digit: req.Digit, Reason: sanitizeNote(req.Reason),
-		Dialog: DialogLine(screen)}); err != nil {
-		warns = append(warns, "audit: "+err.Error())
-	}
-	return strings.Join(warns, "; "), nil
-}
-
 // NoteReq is one escalation annotation, with an optional digit the human
-// can apply with one key. PaneID for the same reason as AnswerReq's: the
-// note and its suggestion belong on the pane the judge looked at, not on
-// whichever pane of a split window is listed first.
+// can apply with one key. PaneID, not a session name: a session whose
+// window is split has several panes sharing session_name, and the note
+// and its suggestion belong on the pane the judge looked at, not
+// whichever one of the split is listed first.
 type NoteReq struct {
 	PaneID  string
 	Text    string
@@ -347,9 +206,10 @@ type NoteReq struct {
 	Now     time.Time
 }
 
-// Note attaches an escalation note to the session's row. Allowed in
-// both modes; ApplyHook clears it at the status transition that ends
-// the episode (RetireStaleEpisodes covers panes with no hook state).
+// Note attaches an escalation note to the session's row — the arbiter's
+// only write path to a monitored session, and not a keystroke. ApplyHook
+// clears it at the status transition that ends the episode
+// (RetireStaleEpisodes covers panes with no hook state).
 // The suggestion is a separate option so the TUI applies a field rather
 // than a number parsed out of the note's prose, and an absent one clears
 // any digit an earlier note left behind — a stale suggestion under fresh
@@ -423,8 +283,8 @@ func Peek(tm Tmux, tr *Transcripts, session string) (string, error) {
 // user's file after first write — never overwritten.
 const arbiterPolicySeed = `# Arbiter policy
 
-You judge dialogs from Claude Code sessions. When unsure, ALWAYS
-escalate with a note instead of answering.
+You judge dialogs from Claude Code sessions. When unsure, omit the digit
+— a note with no suggestion is always safe.
 
 ## Never approve
 - git pushes, force-pushes, rebases, or anything touching a remote
@@ -435,10 +295,10 @@ escalate with a note instead of answering.
   allow", "auto-accept edits") — approve the single action, never the
   standing grant
 
-## Fine to approve (mode full)
+## Safe to suggest
 - running the project's tests, linters, builds, or read-only commands
 
-## Escalate, don't answer
+## Note without a suggestion
 - file edits and writes — a benign-looking diff still needs human eyes
 - anything this policy does not name
 

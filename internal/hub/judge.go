@@ -10,7 +10,7 @@ import (
 // The arbiter is a one-off headless claude per needs-input episode, not
 // a session: coop hook spawns "coop judge <pane>" right after it
 // publishes waiting, the judge builds a prompt from the pane's screen,
-// and claude -p returns a verdict coop applies through Answer/Note.
+// and claude -p returns a verdict coop applies through Note.
 // Nothing the model produces is a command — the verdict is data this
 // package validates before any of it reaches a gate.
 
@@ -20,10 +20,11 @@ const (
 	VerdictEscalate = "escalate"
 )
 
-// Verdict is one judgement: what the model would do about a dialog. It
-// deliberately does not carry the mode — the model is asked what it
-// would do, and coop degrades an answer to a note-with-suggestion when
-// the mode is recommend. One less thing the prompt can get wrong.
+// Verdict is one judgement: what the model would do about a dialog, not
+// what coop does about it. The arbiter has no send path, so an answer
+// always lands as a note carrying the digit as a suggestion, and the two
+// actions differ only in how confident the model was — see applyVerdict
+// for why the prompt is still asked for both.
 type Verdict struct {
 	Action string `json:"action"` // VerdictAnswer | VerdictEscalate
 	Digit  string `json:"digit"`  // single 0-9, "" when no option is named
@@ -134,13 +135,12 @@ type JudgeReq struct {
 	// Agent is HookAgent of the triggering event: the subagent that
 	// asked, "" for the main thread. It only ever labels the prompt —
 	// no gate reads it.
-	Agent   string
-	Allowed []string // pane_current_command allowlist, same gate as the TUI's
-	Audit   string   // audit log path
+	Agent string
+	Audit string // audit log path
 	// Now is read at the moment an action lands, not when the episode
 	// started: a model turn is bounded only by judgeTimeout, so a time
-	// stamped up front would date every audit line and every "answered
-	// N ago" up to a minute early. nil means time.Now.
+	// stamped up front would date every audit line up to a minute early.
+	// nil means time.Now.
 	Now func() time.Time
 	Run func(prompt string) (string, error)
 	Log func(format string, args ...any)
@@ -165,8 +165,7 @@ func (r JudgeReq) now() time.Time {
 // never something that changes what the operator sees. A row that gets
 // no note just reads "waiting", which is true.
 func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
-	mode := ArbiterMode(tm)
-	if mode == ArbiterModeOff {
+	if ArbiterMode(tm) == ArbiterModeOff {
 		return nil // turned off between the hook firing and this process starting
 	}
 	panes, err := tm.ListSessions()
@@ -191,10 +190,6 @@ func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
 	if p.Claude == nil || p.Claude.Status != "waiting" {
 		return nil
 	}
-	// The episode this verdict will be about. Answer re-reads it at send
-	// time and refuses on a mismatch, so a dialog answered and replaced
-	// during the model turn is never the one that receives the digit.
-	since := p.Claude.StatusSince
 	screen, err := tm.CapturePane(p.ID)
 	if err != nil {
 		return err
@@ -219,47 +214,30 @@ func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
 	// One line per episode, whatever the outcome — the judge log used to
 	// hold failures only, and "escalated: cannot see the dialog" was then
 	// indistinguishable from a capture that genuinely showed none. dialog
-	// is the same predicate Answer's gate uses, so a verdict blaming the
-	// screen can be checked against what that gate saw. Deliberately a
-	// summary and not the screen itself: capture output is untrusted and
-	// a terminal's worth of it per episode would bury the log it is
-	// meant to make readable.
+	// is NeedsInputScreen's own verdict on the same capture, so a model
+	// blaming the screen can be checked against what that saw.
+	// Deliberately a summary and not the screen itself: capture output is
+	// untrusted and a terminal's worth of it per episode would bury the
+	// log it is meant to make readable.
 	req.logf("episode %s %q: dialog=%v agent=%q verdict=%s (%s)",
 		p.ID, p.Session, NeedsInputScreen(plain), sanitizeNote(req.Agent),
 		v.Action, sanitizeNote(v.Reason))
-	return applyVerdict(tm, *p, since, mode, v, req)
+	return applyVerdict(tm, *p, v, req)
 }
 
-// applyVerdict routes a verdict through the same gates the helper CLI
-// used to defend. Full mode plus an answer is the only path that sends a
-// key; everything else — recommend mode, an escalation, or an Answer the
-// gates refused — lands as a note, keeping the digit as the suggestion
-// the space key applies.
+// applyVerdict lands a verdict on the pane's row. Every verdict is a
+// note: the arbiter has no send path, so an "answer" and an "escalate"
+// differ only in how confident the model was, and both leave the digit
+// as the suggestion the space key applies. The prompt still offers both
+// actions on purpose — the model is asked what it would do, and coop
+// decides what that is worth, which is one less thing the prompt can get
+// wrong.
 //
-// Both go to p.ID, the pane Judge validated, never to p.Session: a
+// It goes to p.ID, the pane Judge validated, never to p.Session: a
 // session whose window is split has two panes sharing session_name, and
-// the note (which has no screen gate at all) would otherwise park on
-// whichever tmux listed first.
-func applyVerdict(tm Tmux, p Pane, since time.Time, mode string, v Verdict, req JudgeReq) error {
-	text := v.Reason
-	if mode == ArbiterModeFull && v.Action == VerdictAnswer {
-		warn, err := Answer(tm, AnswerReq{PaneID: p.ID, Digit: v.Digit,
-			Reason: v.Reason, Allowed: req.Allowed, Audit: req.Audit,
-			Now: req.now(), Since: since})
-		if err == nil {
-			if warn != "" {
-				req.logf("answered %s with %s (%s)", p.Session, v.Digit, warn)
-			}
-			return nil
-		}
-		// The gates refused after the model committed — the screen
-		// changed, or the pane is a dead claude's shell. Escalate with
-		// the refusal attached rather than retrying: whatever the gate
-		// saw, the human should see too.
-		req.logf("answer refused for %s: %v", p.Session, err)
-		text = v.Reason + " (answer refused: " + err.Error() + ")"
-	}
-	warn, err := Note(tm, NoteReq{PaneID: p.ID, Text: text,
+// the note would otherwise park on whichever tmux listed first.
+func applyVerdict(tm Tmux, p Pane, v Verdict, req JudgeReq) error {
+	warn, err := Note(tm, NoteReq{PaneID: p.ID, Text: v.Reason,
 		Suggest: v.Digit, Audit: req.Audit, Now: req.now()})
 	if warn != "" {
 		req.logf("note on %s: %s", p.Session, warn)

@@ -3,7 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -140,8 +140,8 @@ func mustJSONString(s string) string {
 	return string(b)
 }
 
-// episodeSince is the fixture episode: the @coop_status_since both the
-// pane list and the option Answer re-reads at send time carry.
+// episodeSince is the fixture episode's @coop_status_since, carried by
+// the waiting pane Judge reads.
 const episodeSince = 1700000000
 
 func waitingPane() Pane {
@@ -153,22 +153,15 @@ func waitingPane() Pane {
 }
 
 func judgeFake(mode string) *fakeTmux {
-	f := &fakeTmux{
+	return &fakeTmux{
 		panes:   []Pane{waitingPane()},
 		globals: map[string]string{ArbiterModeMarker: mode},
 		// Needs the ❯ caret NeedsInputScreen's regexp requires on the
-		// selected option — a fixture without it fails Answer's dialog
-		// check before ever exercising the allowlist gate.
+		// selected option — TestJudgeLogsTheEpisode's dialog=true case
+		// depends on it, and every other test just needs a screen that
+		// looks like a live dialog.
 		screen: "May I run the tests?\n❯ 1. Yes\n 2. No",
 		cmd:    "claude",
-	}
-	seedSince(f, "%1")
-	return f
-}
-
-func seedSince(f *fakeTmux, panes ...string) {
-	for _, p := range panes {
-		f.SetPaneOption(p, ClaudeSinceMarker, strconv.FormatInt(episodeSince, 10))
 	}
 }
 
@@ -179,22 +172,33 @@ func runOK(result string) func(string) (string, error) {
 }
 
 func baseReq(run func(string) (string, error)) JudgeReq {
-	return JudgeReq{PaneID: "%1", Detail: "Bash: go test ./...",
-		Allowed: []string{"claude"}, Audit: "",
+	return JudgeReq{PaneID: "%1", Detail: "Bash: go test ./...", Audit: "",
 		Now: func() time.Time { return time.Unix(1700000500, 0) }, Run: run}
 }
 
-func TestJudgeFullModeAnswers(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
-	req := baseReq(runOK(`{"action":"answer","digit":"1","reason":"runs the tests"}`))
-	if err := Judge(f, nil, req); err != nil {
-		t.Fatal(err)
+// An "answer" verdict is still the strongest signal the model can send —
+// it means the policy clearly allowed this. It now lands as a note
+// carrying the digit as the suggestion space applies, exactly as an
+// escalation-with-digit does. Nothing sends a key.
+func TestApplyVerdictAnswerBecomesNote(t *testing.T) {
+	f := &fakeTmux{panes: []Pane{{ID: "%3", Session: "sprocket-v2"}}}
+	req := JudgeReq{
+		Audit: filepath.Join(t.TempDir(), "audit.jsonl"),
+		Now:   func() time.Time { return time.Unix(1700000000, 0) },
 	}
-	if len(f.sent) != 1 || len(f.sent[0]) == 0 || f.sent[0][0] != "1" {
-		t.Errorf("want digit 1 sent, got %v", f.sent)
+	v := Verdict{Action: VerdictAnswer, Digit: "1", Reason: "runs the test suite"}
+
+	if err := applyVerdict(f, f.panes[0], v, req); err != nil {
+		t.Fatalf("applyVerdict: %v", err)
 	}
-	if f.paneOpts["%1/"+ArbiterNoteMarker] != "" {
-		t.Error("an accepted answer should not also leave a note")
+	if got := f.paneOpts["%3/"+ArbiterNoteMarker]; got != "runs the test suite" {
+		t.Fatalf("note = %q, want the verdict's reason", got)
+	}
+	if got := f.paneOpts["%3/"+ArbiterSuggestMarker]; got != "1" {
+		t.Fatalf("suggest = %q, want %q", got, "1")
+	}
+	if len(f.sent) != 0 {
+		t.Fatalf("keys sent: %v — the arbiter must never send", f.sent)
 	}
 }
 
@@ -216,7 +220,7 @@ func TestJudgeRecommendModeDowngradesToNoteWithSuggest(t *testing.T) {
 }
 
 func TestJudgeEscalateNotesWithoutSending(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
+	f := judgeFake(ArbiterModeRecommend)
 	req := baseReq(runOK(`{"action":"escalate","digit":"2","reason":"pushes to a remote"}`))
 	if err := Judge(f, nil, req); err != nil {
 		t.Fatal(err)
@@ -229,93 +233,30 @@ func TestJudgeEscalateNotesWithoutSending(t *testing.T) {
 	}
 }
 
-func TestJudgeFallsBackToNoteWhenAnswerRefused(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
-	f.cmd = "zsh" // dead claude — Answer's allowlist gate refuses
-	req := baseReq(runOK(`{"action":"answer","digit":"1","reason":"runs the tests"}`))
-	if err := Judge(f, nil, req); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.sent) != 0 {
-		t.Error("a refused answer must not send keys")
-	}
-	note := f.paneOpts["%1/"+ArbiterNoteMarker]
-	if !strings.Contains(note, "runs the tests") || !strings.Contains(note, "refused") {
-		t.Errorf("note should carry both the reason and the refusal, got %q", note)
-	}
-}
-
 // A session whose window is split has two panes sharing session_name.
-// The judge reasoned about one of them, so the digit and the note go to
-// that pane id — resolving by name again would answer the wrong pane,
-// and Note (which has no screen gate) would park the suggestion there.
+// The judge reasoned about one of them, so the note and its suggestion
+// go to that pane id — resolving by name again would park both on
+// whichever pane tmux listed first, and Note has no screen gate to catch
+// it.
 func TestJudgeTargetsThePaneItJudged(t *testing.T) {
-	for _, tc := range []struct{ name, verdict, opt string }{
-		{"answer", `{"action":"answer","digit":"1","reason":"runs the tests"}`, ArbiterLastMarker},
-		{"escalate", `{"action":"escalate","digit":"1","reason":"unclear"}`, ArbiterNoteMarker},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := judgeFake(ArbiterModeFull)
-			// The judged pane is the second in the same session.
-			f.panes = []Pane{
-				{ID: "%4", Session: "sprocket-v2"},
-				func() Pane { p := waitingPane(); p.ID = "%5"; return p }(),
-			}
-			seedSince(f, "%5")
-			req := baseReq(runOK(tc.verdict))
-			req.PaneID = "%5"
-			if err := Judge(f, nil, req); err != nil {
-				t.Fatal(err)
-			}
-			if f.paneOpts["%4/"+tc.opt] != "" {
-				t.Errorf("%s landed on %%4, the first pane of the session", tc.opt)
-			}
-			if f.paneOpts["%5/"+tc.opt] == "" {
-				t.Errorf("%s never reached the judged pane", tc.opt)
-			}
-		})
+	f := judgeFake(ArbiterModeRecommend)
+	// The judged pane is the second in the same session.
+	f.panes = []Pane{
+		{ID: "%4", Session: "sprocket-v2"},
+		func() Pane { p := waitingPane(); p.ID = "%5"; return p }(),
 	}
-}
-
-// The episode the judge inspected has to survive the model turn. A
-// dialog answered by the human and replaced by another while claude -p
-// was running passes every other gate; the note it falls back to is what
-// the operator sees instead of a digit in the wrong dialog.
-func TestJudgeRefusesWhenTheEpisodeMovedOn(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
-	req := baseReq(func(string) (string, error) {
-		// The human answers and claude opens a different dialog during
-		// the turn: @coop_status_since moves, the screen still shows a
-		// numbered dialog.
-		seedSince(f, "%1")
-		f.SetPaneOption("%1", ClaudeSinceMarker, "1700000600")
-		return `{"is_error":false,"result":` +
-			mustJSONString(`{"action":"answer","digit":"1","reason":"runs the tests"}`) + `}`, nil
-	})
+	req := baseReq(runOK(`{"action":"escalate","digit":"1","reason":"unclear"}`))
+	req.PaneID = "%5"
 	if err := Judge(f, nil, req); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.sent) != 0 {
-		t.Errorf("digit landed in a dialog the judge never saw: %v", f.sent)
-	}
-	if note := f.paneOpts["%1/"+ArbiterNoteMarker]; !strings.Contains(note, "different dialog") {
-		t.Errorf("note should carry the refusal, got %q", note)
-	}
-}
-
-// The audit line and the row's "answered N ago" are stamped when the
-// action lands, not when the episode opened: a model turn is bounded
-// only by judgeTimeout, so an up-front stamp dates both up to a minute
-// early.
-func TestJudgeStampsTheActionNotTheStart(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
-	req := baseReq(runOK(`{"action":"answer","digit":"1","reason":"runs the tests"}`))
-	if err := Judge(f, nil, req); err != nil {
-		t.Fatal(err)
-	}
-	last, ok := ParseArbiterLast(f.paneOpts["%1/"+ArbiterLastMarker])
-	if !ok || !last.At.Equal(time.Unix(1700000500, 0)) {
-		t.Errorf("marker at %v, want the time Now returned at apply", last.At)
+	for _, opt := range []string{ArbiterNoteMarker, ArbiterSuggestMarker} {
+		if f.paneOpts["%4/"+opt] != "" {
+			t.Errorf("%s landed on %%4, the first pane of the session", opt)
+		}
+		if f.paneOpts["%5/"+opt] == "" {
+			t.Errorf("%s never reached the judged pane", opt)
+		}
 	}
 }
 
@@ -324,7 +265,7 @@ func TestJudgeStampsTheActionNotTheStart(t *testing.T) {
 // explicitly not a second source (its format is internal and unstable,
 // and LastText's main-thread-only rule is what created this gap).
 func TestJudgeCarriesTheSubagentIntoThePrompt(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
+	f := judgeFake(ArbiterModeRecommend)
 	var prompt string
 	req := baseReq(func(p string) (string, error) {
 		prompt = p
@@ -352,7 +293,7 @@ func TestJudgeLogsTheEpisode(t *testing.T) {
 		{"no dialog on screen", "just some scrollback\n", "dialog=false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := judgeFake(ArbiterModeFull)
+			f := judgeFake(ArbiterModeRecommend)
 			f.screen = tc.screen
 			var lines []string
 			req := baseReq(runOK(`{"action":"escalate","reason":"a human should look"}`))
@@ -398,7 +339,7 @@ func TestJudgeSkipsWhenModeOff(t *testing.T) {
 }
 
 func TestJudgeSkipsWhenNoLongerWaiting(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
+	f := judgeFake(ArbiterModeRecommend)
 	f.panes[0].Claude.Status = "busy" // the human answered first
 	called := false
 	req := baseReq(func(string) (string, error) { called = true; return "", nil })
@@ -411,7 +352,7 @@ func TestJudgeSkipsWhenNoLongerWaiting(t *testing.T) {
 }
 
 func TestJudgeMalformedVerdictLeavesRowAlone(t *testing.T) {
-	f := judgeFake(ArbiterModeFull)
+	f := judgeFake(ArbiterModeRecommend)
 	req := baseReq(runOK("I could not decide."))
 	if err := Judge(f, nil, req); err == nil {
 		t.Fatal("want an error for the log")

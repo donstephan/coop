@@ -14,13 +14,10 @@ import (
 type AuditEntry struct {
 	Time    time.Time `json:"time"`
 	Session string    `json:"session"`
-	Action  string    `json:"action"` // "answered" | "escalated"
-	Digit   string    `json:"digit,omitempty"`
-	// Suggest is the digit an escalation offered for the human to apply;
-	// kept apart from Digit so that field always means "a key was sent".
+	Action  string    `json:"action"` // "escalated" — the only action left
+	// Suggest is the digit an escalation offered for the human to apply.
 	Suggest string `json:"suggest,omitempty"`
 	Reason  string `json:"reason"`
-	Dialog  string `json:"dialog,omitempty"`
 }
 
 // stateDir resolves $XDG_STATE_HOME/coop, falling back to

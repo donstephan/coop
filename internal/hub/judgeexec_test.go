@@ -331,3 +331,9 @@ func TestJudgePathLeadsWithTheCoopBinaryDir(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultArbiterModelIsSonnet(t *testing.T) {
+	if DefaultArbiterModel != "sonnet" {
+		t.Fatalf("DefaultArbiterModel = %q, want %q", DefaultArbiterModel, "sonnet")
+	}
+}

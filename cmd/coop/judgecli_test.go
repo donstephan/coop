@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"coop/internal/config"
 	"coop/internal/hub"
 )
 
@@ -38,81 +37,32 @@ func TestJudgeArgvShape(t *testing.T) {
 	}
 }
 
-// The judge's allowlist is the operator's file, never a flag and never
-// the environment — and an explicitly empty list is a setting, not an
-// omission: it means send nothing, the same as -allowed-cmds "" already
-// means on the TUI's side of the same gate.
-func TestJudgeAllowedCmds(t *testing.T) {
-	cfg := func(list []string) config.Config {
-		var c config.Config
-		c.Arbiter.AllowedCmds = list
-		return c
+// An unparseable config used to mean "no send gate". There is no gate
+// any more — the judge cannot send — so a broken file costs only the
+// configured model, and that is logged rather than silent.
+func TestJudgeConfigUnparseableFileUsesDefaultModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		name string
-		in   []string
-		want []string
-	}{
-		{"absent falls back to the built-in", nil, []string{"claude", "node"}},
-		{"explicitly empty sends nothing", []string{}, nil},
-		{"blank entries are not a list", []string{"", "  "}, nil},
-		{"operator's list wins", []string{"claude, node", "bun"},
-			[]string{"claude", "node", "bun"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := judgeAllowedCmds(cfg(tc.in)); !slices.Equal(got, tc.want) {
-				t.Errorf("judgeAllowedCmds(%v) = %v, want %v", tc.in, got, tc.want)
-			}
-		})
+	var logged string
+	got := judgeConfig(path, func(f string, a ...any) { logged = fmt.Sprintf(f, a...) })
+	if got != hub.DefaultArbiterModel {
+		t.Fatalf("model = %q, want %q", got, hub.DefaultArbiterModel)
 	}
-}
-
-// A judge whose config file is present but unparseable must not regain
-// the built-in send gate: an operator who wrote allowed_cmds [] ("never
-// send") and later broke the JSON — or wrote a bare string where the
-// list belongs, which fails the whole Config unmarshal — would otherwise
-// have every judge silently answering dialogs again, with nothing in the
-// log to say so.
-func TestJudgeConfigFailsClosedOnAnUnparseableFile(t *testing.T) {
-	for _, tc := range []struct {
-		name, body string
-	}{
-		{"syntax error", `{"arbiter": {"allowed_cmds": []},}`},
-		{"string where a list belongs", `{"arbiter": {"allowed_cmds": "claude"}}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.json")
-			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			var logged []string
-			model, allowed := judgeConfig(path, func(f string, a ...any) {
-				logged = append(logged, fmt.Sprintf(f, a...))
-			})
-			if allowed != nil {
-				t.Errorf("allowed = %v, want no send gate at all", allowed)
-			}
-			if model != hub.DefaultArbiterModel {
-				t.Errorf("model = %q, want the default", model)
-			}
-			if len(logged) == 0 {
-				t.Error("an unparseable config must say so in the judge log")
-			}
-		})
+	if logged == "" {
+		t.Fatal("an unparseable config must be logged")
 	}
 }
 
 // A config that is simply absent is not an error: the operator never
-// wrote one, and the built-in defaults are what they get.
+// wrote one, and the default model is what they get.
 func TestJudgeConfigMissingFileFallsBack(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	var logged []string
-	model, allowed := judgeConfig(path, func(f string, a ...any) {
+	model := judgeConfig(path, func(f string, a ...any) {
 		logged = append(logged, fmt.Sprintf(f, a...))
 	})
-	if !slices.Equal(allowed, []string{"claude", "node"}) {
-		t.Errorf("allowed = %v, want the built-in list", allowed)
-	}
 	if model != hub.DefaultArbiterModel {
 		t.Errorf("model = %q, want the default", model)
 	}
@@ -121,17 +71,16 @@ func TestJudgeConfigMissingFileFallsBack(t *testing.T) {
 	}
 }
 
-// A file that parses is obeyed, including the empty list that means
-// "never send".
+// A file that parses is obeyed.
 func TestJudgeConfigHonoursTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	body := `{"arbiter": {"model": "sonnet", "allowed_cmds": []}}`
+	body := `{"arbiter": {"model": "sonnet"}}`
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	model, allowed := judgeConfig(path, func(string, ...any) {})
-	if model != "sonnet" || allowed != nil {
-		t.Errorf("model = %q allowed = %v, want sonnet and no send gate", model, allowed)
+	model := judgeConfig(path, func(string, ...any) {})
+	if model != "sonnet" {
+		t.Errorf("model = %q, want sonnet", model)
 	}
 }
 
@@ -193,9 +142,9 @@ func TestSpawnJudgeGates(t *testing.T) {
 		// No episode key (ApplyHook's write failed): skipping beats
 		// claiming the pane itself and wedging it until the claim ages out.
 		{"no since", &gateTmux{globals: map[string]string{
-			hub.ArbiterModeMarker: hub.ArbiterModeFull}}, permissionRequest()},
+			hub.ArbiterModeMarker: hub.ArbiterModeRecommend}}, permissionRequest()},
 		{"since unreadable", func() *gateTmux {
-			g := waitingTmux(hub.ArbiterModeFull)
+			g := waitingTmux(hub.ArbiterModeRecommend)
 			g.optErr = errors.New("pane gone")
 			return g
 		}(), permissionRequest()},
@@ -254,7 +203,7 @@ func TestSpawnJudgeSpawnsOncePerEpisode(t *testing.T) {
 	judgeSpawn = func(argv, env []string) error { envs = append(envs, env); return nil }
 	t.Cleanup(func() { judgeSpawn = prev })
 
-	tm := waitingTmux(hub.ArbiterModeFull)
+	tm := waitingTmux(hub.ArbiterModeRecommend)
 	spawnJudge(tm, "coop", "%1", permissionRequest())
 	if len(envs) != 1 {
 		t.Fatalf("spawned %d judges, want 1", len(envs))
@@ -300,7 +249,7 @@ func TestSpawnJudgeReleasesTheClaimWhenStartFails(t *testing.T) {
 	}
 	t.Cleanup(func() { judgeSpawn = prev })
 
-	tm := waitingTmux(hub.ArbiterModeFull)
+	tm := waitingTmux(hub.ArbiterModeRecommend)
 	spawnJudge(tm, "coop", "%1", permissionRequest())
 	fail = false
 	spawnJudge(tm, "coop", "%1", permissionRequest())
@@ -346,7 +295,7 @@ func TestSpawnJudgeArgvCarriesTheSubagent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeClaims(t)
 			argvs := captureSpawns(t, nil)
-			spawnJudge(waitingTmux(hub.ArbiterModeFull), "coop", "%1", tc.p)
+			spawnJudge(waitingTmux(hub.ArbiterModeRecommend), "coop", "%1", tc.p)
 			if len(*argvs) != 1 {
 				t.Fatalf("spawned %d judges", len(*argvs))
 			}
@@ -369,7 +318,7 @@ func TestSpawnJudgeArgvCarriesTheSubagent(t *testing.T) {
 func TestSpawnJudgeSkipsWhenTheClaimCannotBeTaken(t *testing.T) {
 	unclaimable(t)
 	argvs := captureSpawns(t, nil)
-	spawnJudge(waitingTmux(hub.ArbiterModeFull), "coop", "%1", permissionRequest())
+	spawnJudge(waitingTmux(hub.ArbiterModeRecommend), "coop", "%1", permissionRequest())
 	if len(*argvs) != 0 {
 		t.Errorf("spawned %v with nowhere to claim the episode", *argvs)
 	}

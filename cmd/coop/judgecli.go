@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"coop/internal/config"
@@ -81,18 +80,17 @@ func runJudgeCLI(args []string) int {
 		logf("arbiter home: %v", err)
 		return 1
 	}
-	model, allowed := judgeConfig(cfgPath, logf)
+	model := judgeConfig(cfgPath, logf)
 
 	tm := &hub.ExecTmux{Socket: *socket}
 	err = hub.Judge(tm, hub.DefaultTranscripts(), hub.JudgeReq{
-		PaneID:  pane,
-		Detail:  *detail,
-		Agent:   *agent,
-		Allowed: allowed,
-		Audit:   hub.DefaultAuditPath(),
-		Now:     time.Now,
-		Run:     hub.ClaudeJudgeRunner(dir, model, hub.JudgeSystemPrompt(policy)),
-		Log:     logf,
+		PaneID: pane,
+		Detail: *detail,
+		Agent:  *agent,
+		Audit:  hub.DefaultAuditPath(),
+		Now:    time.Now,
+		Run:    hub.ClaudeJudgeRunner(dir, model, hub.JudgeSystemPrompt(policy)),
+		Log:    logf,
 	})
 	if err != nil {
 		logf("judge %s: %v", pane, err)
@@ -101,53 +99,26 @@ func runJudgeCLI(args []string) int {
 	return 0
 }
 
-// judgeConfig resolves the model and the send gate from the config
-// file. Three cases, not two — an unparseable file is not a missing one:
+// judgeConfig resolves the model from the config file. An unparseable
+// file is not a missing one — it is logged, because the operator wrote
+// something they believed was in effect. It is no longer a safety
+// question: the judge has no send path, so the worst a broken file costs
+// is a judgement from the default model.
 //
-//   - no file: the built-in defaults, the same as an operator who never
-//     wrote one.
-//   - a file that parses: its settings, including a present-but-empty
-//     allowed_cmds, which means send nothing.
-//   - a file that does not parse: no send gate at all, logged. The
-//     failure this closes is the operator who set allowed_cmds to []
-//     and later introduced a syntax error — or wrote "claude" where the
-//     list belongs, which fails the whole Config unmarshal. Falling back
-//     to the built-in claude,node there silently *widens* a gate the
-//     file was narrowing, which is the one direction a config error must
-//     never move. Escalating with no send gate is the same behaviour a
-//     deliberate [] asks for.
-//
-// The model is not treated the same way: a default model on a broken
-// file costs a cheaper judgement, not a wrong keystroke.
-func judgeConfig(cfgPath string, logf func(string, ...any)) (string, []string) {
+// The path is config.DefaultPath() and nothing else — see the comment at
+// the call site for why a flag, an environment variable, and a tmux
+// option were all rejected.
+func judgeConfig(cfgPath string, logf func(string, ...any)) string {
 	c, err := config.Load(cfgPath)
 	switch {
 	case err == nil:
-		model := hub.DefaultArbiterModel
 		if c.Arbiter.Model != "" {
-			model = c.Arbiter.Model
+			return c.Arbiter.Model
 		}
-		return model, judgeAllowedCmds(c)
-	case os.IsNotExist(err):
-		return hub.DefaultArbiterModel, judgeAllowedCmds(config.Config{})
-	default:
-		logf("config: %v: judging with no send gate (escalate only)", err)
-		return hub.DefaultArbiterModel, nil
+	case !os.IsNotExist(err):
+		logf("config: %v: judging with the default model", err)
 	}
-}
-
-// judgeAllowedCmds is the pane_current_command allowlist a verdict's
-// digit is gated by. A present-but-empty arbiter.allowed_cmds means
-// "send nothing" — the most restrictive setting an operator can write,
-// exactly as -allowed-cmds "" already means for the TUI's own digit
-// keys; only an absent key falls back to the built-in list. splitCmds,
-// not the raw entries, so "claude, node" written as one string or as two
-// means the same list the hub's flag would parse.
-func judgeAllowedCmds(c config.Config) []string {
-	if c.Arbiter.AllowedCmds == nil {
-		return splitCmds(hub.DefaultAllowedCmds)
-	}
-	return splitCmds(strings.Join(c.Arbiter.AllowedCmds, ","))
+	return hub.DefaultArbiterModel
 }
 
 // openJudgeLog appends to the judge log, falling back to a no-op logger

@@ -14,9 +14,9 @@ import (
 // isArbiterCmd reports whether argv selects the peek subcommand — a
 // human debug aid that prints a session's screen and last assistant
 // message. answer and note used to live here too, as the arbiter
-// session's tool surface; the judge produces a verdict coop applies
-// through hub.Answer/hub.Note directly, so there is no longer a CLI
-// surface a model could reach for at all.
+// session's tool surface; the judge now produces a verdict coop applies
+// through hub.Note directly, so there is no longer a CLI surface a model
+// could reach for at all.
 func isArbiterCmd(args []string) bool {
 	return len(args) > 0 && args[0] == "peek"
 }

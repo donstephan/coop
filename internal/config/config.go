@@ -22,15 +22,7 @@ type Config struct {
 	Tmux []string `json:"tmux"`
 	// Arbiter configures the a-key triage judge.
 	Arbiter struct {
-		Model string `json:"model"` // claude model id/alias; "" = haiku
-		// AllowedCmds is the pane_current_command allowlist a judge's
-		// answer is gated by. It lives in this file rather than in a flag
-		// or the environment because a judge is spawned from inside the
-		// pane it judges — the one place the gate must not be readable
-		// from. nil (key absent) means the built-in claude,node; an empty
-		// list means send nothing, the same as -allowed-cmds "" does for
-		// the TUI's own digit keys.
-		AllowedCmds []string `json:"allowed_cmds"`
+		Model string `json:"model"` // claude model id/alias; "" = sonnet
 	} `json:"arbiter"`
 }
 

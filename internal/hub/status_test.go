@@ -269,16 +269,3 @@ func TestStripANSI(t *testing.T) {
 		t.Errorf("StripANSI = %q", got)
 	}
 }
-
-func TestDialogLine(t *testing.T) {
-	screen := "some earlier output\n\n" +
-		"Do you want to run go test?\n" +
-		"\x1b[36m❯ 1. Yes\x1b[0m\n" +
-		"  2. No\n"
-	if got := DialogLine(screen); got != "Do you want to run go test?" {
-		t.Errorf("DialogLine = %q", got)
-	}
-	if got := DialogLine("no dialog here\njust text\n"); got != "" {
-		t.Errorf("DialogLine on plain text = %q", got)
-	}
-}

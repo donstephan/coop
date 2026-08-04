@@ -931,23 +931,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statCol = m.statCol.next()
 		return m, m.resizeSelf()
 	case "a":
-		// Cycle off → recommend → full → off, the s-key precedent. Mode
-		// is a socket-global tmux option now, not a session's existence,
-		// so turning it off is a write like any other — no confirm.
+		// Toggle off ↔ recommend. Mode is a socket-global tmux option, not
+		// a session's existence, so turning it off is a write like any
+		// other — no confirm. There is no third mode: the arbiter cannot
+		// send keys, so the only question is whether it judges at all.
 		next := hub.ArbiterModeRecommend
-		switch m.arbiterMode {
-		case hub.ArbiterModeRecommend:
-			next = hub.ArbiterModeFull
-		case hub.ArbiterModeFull:
+		if m.arbiterMode == hub.ArbiterModeRecommend {
 			next = hub.ArbiterModeOff
 		}
 		m.arbiterMode = next // optimistic; the next poll is authoritative
 		return m, m.arbiterModeCmd(next)
 	case " ":
 		// Apply the arbiter's suggestion: the same send the digit key
-		// makes, minus reading the number out of the note. Not gated on
-		// mode — a full-mode arbiter that escalated instead of answering
-		// still leaves a digit worth one key.
+		// makes, minus reading the number out of the note. This is the
+		// only path from a verdict to a keystroke, and a human presses
+		// it — the judge itself can only annotate.
 		if s := m.selectedSuggest(); s != "" {
 			return m, m.answerCmd(m.selectedID, s)
 		}
@@ -1698,7 +1696,7 @@ func wrapMsg(text string, width, max, offset int) ([]string, int) {
 }
 
 // arbiterHint is the a key's footer chip, doubling as the mode display:
-// "a arbiter off|recommend|full".
+// "a arbiter off|recommend".
 func (m Model) arbiterHint() string {
 	return "a arbiter " + m.arbiterMode
 }
@@ -1713,21 +1711,17 @@ func (m Model) selectedSuggest() string {
 	return hub.ArbiterSuggestOf(m.panes[i])
 }
 
-// arbiterDetail is the selected row's arbiter line: an active
-// escalation note, else the last answer, else nothing. The text comes back
-// unstyled so it can be wrapped before the style is applied per line.
+// arbiterDetail is the selected row's arbiter line: the active escalation
+// note, or nothing. A note is all there is — the arbiter never answers, so
+// there is no past answer to report. The text comes back unstyled so it
+// can be wrapped before the style is applied per line.
 func (m Model) arbiterDetail() (string, lipgloss.Style) {
 	i := m.indexOf(m.selectedID)
 	if i < 0 {
 		return "", footStyle
 	}
-	p := m.panes[i]
-	if p.ArbiterNote != "" {
+	if p := m.panes[i]; p.ArbiterNote != "" {
 		return "arbiter: " + p.ArbiterNote, needsStyle
-	}
-	if last, ok := hub.ParseArbiterLast(p.ArbiterLast); ok {
-		return fmt.Sprintf("answered %s by arbiter %s ago — %s",
-			last.Digit, age(last.At), last.Reason), footStyle
 	}
 	return "", footStyle
 }

@@ -17,8 +17,8 @@ import (
 // @coop_notified, the arbiter episode markers, the hook-published Claude
 // state), empty when unset — paneFields of them in all.
 func TestParsePanes(t *testing.T) {
-	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
-		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n"
+	out := "roost\x1f%0\x1f795186\x1f✻ coop\x1f0\x1fcoop\x1f1753279140\x1f/home/user/coop\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
+		"sprocket-v2\x1f%8\x1f920957\x1f⠂ Simplify tmux session management\x1f1\x1fclaude\x1f1753286474\x1f/home/user/sprocket-v2\x1f\x1f1\x1f\x1f1\x1f\x1f\x1f\x1f\x1f\x1f\n"
 	panes := parsePanes(out)
 	if len(panes) != 2 {
 		t.Fatalf("got %d panes, want 2", len(panes))
@@ -44,13 +44,13 @@ func TestParsePanes(t *testing.T) {
 }
 
 func TestParsePanesDoneSince(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f1753286000\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].DoneSince.Equal(time.Unix(1753286000, 0)) {
 		t.Fatalf("done-since should parse as unix time, got %+v", panes)
 	}
 	// Unset and garbage both read as zero — badge simply not armed.
 	for _, raw := range []string{"", "notanumber"} {
-		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+		panes = parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f" + raw + "\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 		if len(panes) != 1 || !panes[0].DoneSince.IsZero() {
 			t.Fatalf("done-since %q should yield zero time, got %+v", raw, panes)
 		}
@@ -59,7 +59,7 @@ func TestParsePanesDoneSince(t *testing.T) {
 
 func TestParsePanesSkipsMalformed(t *testing.T) {
 	out := "garbage line with no separators\n" +
-		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
+		"ok\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/ok\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n" +
 		"\n"
 	panes := parsePanes(out)
 	if len(panes) != 1 || panes[0].Session != "ok" {
@@ -68,7 +68,7 @@ func TestParsePanesSkipsMalformed(t *testing.T) {
 }
 
 func TestParsePanesBadTimestamp(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f4242\x1ftitle\x1f0\x1fclaude\x1fnotanumber\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || !panes[0].Created.IsZero() {
 		t.Fatalf("bad timestamp should yield zero time, got %+v", panes)
 	}
@@ -77,7 +77,7 @@ func TestParsePanesBadTimestamp(t *testing.T) {
 // An unreadable pid reads as 0 — pane_pid isn't joined on for status
 // anymore, so this is just a parse-safety check, not a fallback trigger.
 func TestParsePanesBadPID(t *testing.T) {
-	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
+	panes := parsePanes("s\x1f%1\x1f\x1ftitle\x1f0\x1fclaude\x1f100\x1f/tmp/s\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\x1f\n")
 	if len(panes) != 1 || panes[0].PID != 0 {
 		t.Fatalf("bad pid should yield 0, got %+v", panes)
 	}
@@ -206,7 +206,7 @@ func TestParsePanesClaudeOptions(t *testing.T) {
 	base := []string{
 		"alpha", "%1", "42", "✳ Claude Code", "0", "claude",
 		"1753900000", "/home/user/alpha",
-		"", "", "", "", "", "", "",
+		"", "", "", "", "", "",
 	}
 	published := strings.Join(append(append([]string{}, base...),
 		"waiting", "1753900100", "sess-1", "/home/user/alpha"), "\x1f")
@@ -235,7 +235,7 @@ func TestParsePanesClaudeOptions(t *testing.T) {
 func TestParsePanesClaudeOptionsEscaped(t *testing.T) {
 	fields := []string{
 		"alpha", "%1", "42", "t", "0", "claude", "1753900000", "/home/user/alpha",
-		"", "", "", "", "", "", "",
+		"", "", "", "", "", "",
 		"busy", "1753900100", "sess-1", "/home/user/alpha",
 	}
 	panes := parsePanes(strings.Join(fields, `\037`)) // tmux ≤ 3.4 vis(3) form
@@ -249,7 +249,7 @@ func TestParsePanesClaudeOptionsEscaped(t *testing.T) {
 // format.
 func TestParsePanesArbiterFields(t *testing.T) {
 	line := "alpha\x1f%9\x1f42\x1ftitle\x1f0\x1fclaude\x1f1700000000\x1f/home/user/alpha\x1f\x1f\x1f\x1f" +
-		"\x1fasking to run tests\x1f1\x1f1|1700000100|approved tests\x1f\x1f\x1f\x1f"
+		"\x1fasking to run tests\x1f1\x1f\x1f\x1f\x1f"
 	panes := parsePanes(line)
 	if len(panes) != 1 {
 		t.Fatalf("got %d panes, want 1", len(panes))
@@ -258,8 +258,36 @@ func TestParsePanesArbiterFields(t *testing.T) {
 	if p.ArbiterNote != "asking to run tests" || p.ArbiterSuggest != "1" {
 		t.Errorf("note = %q, suggest = %q", p.ArbiterNote, p.ArbiterSuggest)
 	}
-	if p.ArbiterLast != "1|1700000100|approved tests" {
-		t.Errorf("last = %q", p.ArbiterLast)
+}
+
+func TestParsePanesClaudeFieldsShiftDown(t *testing.T) {
+	// Removing @coop_arbiter_last shifts the claude-state fields down
+	// one. A wrong index here misparses status into the wrong column
+	// rather than erroring, so assert each one by name.
+	f := []string{"alpha", "%1", "1234", "title", "0", "claude",
+		"1700000000", "/home/user/sprocket-v2", "0", "0", "", "0",
+		"note text", "2", "busy", "1700000100", "sess-id",
+		"/home/user/sprocket-v2"}
+	if len(f) != paneFields {
+		t.Fatalf("fixture has %d fields, paneFields is %d", len(f), paneFields)
+	}
+	panes := parsePanes(strings.Join(f, `\037`) + "\n")
+	if len(panes) != 1 {
+		t.Fatalf("parsePanes returned %d panes, want 1", len(panes))
+	}
+	p := panes[0]
+	if p.ArbiterNote != "note text" || p.ArbiterSuggest != "2" {
+		t.Fatalf("arbiter fields = %q/%q", p.ArbiterNote, p.ArbiterSuggest)
+	}
+	if p.Claude == nil {
+		t.Fatal("claude state is nil — the status field index is wrong")
+	}
+	if p.Claude.Status != "busy" || p.Claude.SessionID != "sess-id" ||
+		p.Claude.CWD != "/home/user/sprocket-v2" {
+		t.Fatalf("claude state = %+v", p.Claude)
+	}
+	if !p.Claude.StatusSince.Equal(time.Unix(1700000100, 0)) {
+		t.Fatalf("status since = %v", p.Claude.StatusSince)
 	}
 }
 

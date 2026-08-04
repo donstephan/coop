@@ -125,19 +125,17 @@ opt_is() { # opt_is <option> <want>
   exit 1
 }
 
-# a cycles the socket-global mode off -> recommend -> full -> off. It is
+# a toggles the socket-global mode off -> recommend -> off. It is
 # pure tmux state (no hook fires from pressing it), so this is safe to
 # run any time — but it runs last regardless, after every assertion
 # that depends on the stub's one and only hook event, so a stray hook
-# firing during the cycle is never a possibility either.
+# firing during the toggle is never a possibility either.
 mode_is() { opt_is @coop_arbiter_mode "$1"; }
 tmux -L "$SOCKET" send-keys -t "$nav" "a"
 mode_is recommend
 tmux -L "$SOCKET" send-keys -t "$nav" "a"
-mode_is full
-tmux -L "$SOCKET" send-keys -t "$nav" "a"
 mode_is ""
-echo "ok: a cycles arbiter mode off -> recommend -> full -> off"
+echo "ok: a toggles arbiter mode off -> recommend -> off"
 
 # A second session; selecting it must retarget the live pane.
 tmux -L "$SOCKET" new-session -d -s zstub -c "$TMPD/zstub" "sleep 300"

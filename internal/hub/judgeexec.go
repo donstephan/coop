@@ -13,11 +13,15 @@ import (
 	"time"
 )
 
-// DefaultArbiterModel is what arbiter.model defaults to. A judging
-// episode is a single-shot classification over a bounded prompt with a
-// fixed output schema — the cheapest tier that can follow the policy is
-// the right one.
-const DefaultArbiterModel = "haiku"
+// DefaultArbiterModel is what arbiter.model defaults to. It was haiku
+// while a verdict could send a keystroke and the classification was the
+// product. It is not any more: the arbiter only annotates, so the note a
+// human reads on the row — and the digit they apply with one key — *is*
+// the product, formed by summarizing a captured terminal that an
+// attacker can influence. The whole per-episode cost is a bounded prompt
+// and a one-line verdict, so the better model is worth it; an operator
+// who disagrees sets arbiter.model.
+const DefaultArbiterModel = "sonnet"
 
 // judgeTimeout bounds one episode. A judge that hangs is one row that
 // stays plain "waiting", which the operator's own eyes still cover.
@@ -58,11 +62,13 @@ const claimTTL = 24 * time.Hour
 
 // ClaimEpisode claims one needs-input episode, so exactly one judge is
 // spawned for it. Two coop hook processes can be in flight for the same
-// dialog (a PermissionRequest and the Notification about it), and two
-// judges answering one dialog means the second digit lands in whatever
-// the first opened. A tmux option cannot be tested and set in one step,
-// so the claim is an O_EXCL create under coop's state directory, which
-// can.
+// dialog (a PermissionRequest and the Notification about it), and without
+// the claim each starts a judge: two model calls billed for one dialog,
+// and two notes racing to land on the row, where the last write wins and
+// the operator has no way to tell which verdict they are reading. One
+// episode is one turn and one note. A tmux option cannot be tested and
+// set in one step, so the claim is an O_EXCL create under coop's state
+// directory, which can.
 //
 // The key is the pane plus the episode's @coop_status_since — an option
 // that only moves when the status actually changes, so the next dialog on
@@ -70,8 +76,8 @@ const claimTTL = 24 * time.Hour
 // this file is never removed (a killed judge, a reboot). "Usually":
 // since is unix seconds, so two episodes on one pane inside a single
 // second share a key and the second is silently never judged. That fails
-// safe (a row that just reads "waiting"), and it is the same
-// one-second resolution Answer's episode check lives with.
+// safe — a row that just reads "waiting", which is true, and which the
+// operator's own eyes still cover.
 //
 // The directory comes from claimRoot, not stateDir, because this runs
 // inside coop hook — see claimRoot for why that distinction is the whole

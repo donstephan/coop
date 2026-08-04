@@ -76,7 +76,6 @@ type Pane struct {
 	// not per pane.
 	ArbiterNote    string // @coop_arbiter_note — "" when none
 	ArbiterSuggest string // @coop_arbiter_suggest — digit the note suggests, "" when none
-	ArbiterLast    string // @coop_arbiter_last — "" when never answered
 }
 
 // Repo is the pane's repo group: the session start directory's basename.
@@ -137,13 +136,12 @@ const (
 	// can reach this socket, monitored sessions included (see the
 	// arbiter section of CLAUDE.md): they are shared display and episode
 	// state, never a security boundary.
-	ArbiterModeMarker = "@coop_arbiter_mode" // global: "recommend" | "full", unset = off
+	ArbiterModeMarker = "@coop_arbiter_mode" // global: "recommend", unset = off
 	ArbiterNoteMarker = "@coop_arbiter_note" // escalation note shown on the row
 	// ArbiterSuggestMarker is the digit an escalating verdict named, kept
 	// apart from the note text so the space key applies a field rather
 	// than a number parsed out of prose.
 	ArbiterSuggestMarker = "@coop_arbiter_suggest"
-	ArbiterLastMarker    = "@coop_arbiter_last" // "digit|unix|reason" of the last answer
 
 	// Hook-published Claude state (see hook.go): the injected coop
 	// hooks write these onto their own pane; the poll reads them back
@@ -157,11 +155,11 @@ const (
 
 // \x1f (unit separator) can't appear in titles or session names; \t can.
 // The trailing user options render as "" when unset.
-const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ArbiterLastMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
+const paneFormat = "#{session_name}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_title}\x1f#{window_bell_flag}\x1f#{pane_current_command}\x1f#{session_created}\x1f#{session_path}\x1f#{" + HubMarker + "}\x1f#{" + WorkingMarker + "}\x1f#{" + DoneSinceMarker + "}\x1f#{" + NotifiedMarker + "}\x1f#{" + ArbiterNoteMarker + "}\x1f#{" + ArbiterSuggestMarker + "}\x1f#{" + ClaudeStatusMarker + "}\x1f#{" + ClaudeSinceMarker + "}\x1f#{" + ClaudeSessionMarker + "}\x1f#{" + ClaudeCWDMarker + "}"
 
 // paneFields is paneFormat's field count. parsePanes drops any line that
 // does not have exactly this many, so the two must move together.
-const paneFields = 19
+const paneFields = 18
 
 // escapedSep is what tmux ≤ 3.4 prints instead of the \x1f separator:
 // those versions run -F output through vis(3), so every non-printable
@@ -204,11 +202,11 @@ func parsePanes(out string) []Pane {
 			Bell: f[4] == "1", Cmd: f[5], Created: unixTime(f[6]), Path: f[7],
 			Hub: f[8] == "1", WorkingMark: f[9] == "1", DoneSince: unixTime(f[10]),
 			NotifiedMark: f[11] == "1",
-			ArbiterNote:  f[12], ArbiterSuggest: f[13], ArbiterLast: f[14],
+			ArbiterNote:  f[12], ArbiterSuggest: f[13],
 		}
-		if f[15] != "" {
-			p.Claude = &ClaudeState{Status: f[15], StatusSince: unixTime(f[16]),
-				SessionID: f[17], CWD: f[18]}
+		if f[14] != "" {
+			p.Claude = &ClaudeState{Status: f[14], StatusSince: unixTime(f[15]),
+				SessionID: f[16], CWD: f[17]}
 		}
 		panes = append(panes, p)
 	}

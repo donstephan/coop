@@ -13,7 +13,7 @@ func TestAppendAudit(t *testing.T) {
 	// Path with a missing parent dir — AppendAudit must create it.
 	path := filepath.Join(t.TempDir(), "state", "audit.jsonl")
 	e1 := AuditEntry{Time: time.Unix(1700000000, 0).UTC(), Session: "alpha",
-		Action: "answered", Digit: "1", Reason: "running tests", Dialog: "Run go test?"}
+		Action: "escalated", Suggest: "1", Reason: "running tests"}
 	e2 := AuditEntry{Time: time.Unix(1700000060, 0).UTC(), Session: "beta",
 		Action: "escalated", Reason: "asking about schema design"}
 	if err := AppendAudit(path, e1); err != nil {
@@ -34,12 +34,12 @@ func TestAppendAudit(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Session != "alpha" || got.Action != "answered" || got.Digit != "1" {
+	if got.Session != "alpha" || got.Action != "escalated" || got.Suggest != "1" {
 		t.Errorf("line 1 = %+v", got)
 	}
-	// escalated entries carry no digit key at all.
-	if strings.Contains(lines[1], `"digit"`) {
-		t.Errorf("escalated entry has digit key: %s", lines[1])
+	// an escalation with no suggested digit carries no suggest key at all.
+	if strings.Contains(lines[1], `"suggest"`) {
+		t.Errorf("escalated entry has suggest key: %s", lines[1])
 	}
 }
 

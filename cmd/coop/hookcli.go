@@ -86,8 +86,8 @@ func spawnJudge(tm judgeTmux, socket, pane string, p hub.HookPayload) {
 	// The episode key: one judge per needs-input episode, claimed
 	// atomically below. Two hook processes can be in flight for the same
 	// dialog (a PermissionRequest and the Notification about it), and two
-	// judges answering one dialog means the second digit lands in
-	// whatever the first opened.
+	// judges on one dialog means two model calls for it and two notes
+	// overwriting each other on the row.
 	since, err := tm.PaneOption(pane, hub.ClaudeSinceMarker)
 	if err != nil || since == "" {
 		// No episode key: ApplyHook's write just failed, or this pane
