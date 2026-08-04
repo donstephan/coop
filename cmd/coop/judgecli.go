@@ -24,8 +24,14 @@ func isJudgeCmd(args []string) bool {
 
 // judgeArgv is the command line coop hook spawns. Kept apart from the
 // spawn itself so the shape is testable without starting a process.
-func judgeArgv(self, socket, pane, detail string) []string {
-	return []string{self, "judge", "-socket", socket, "-detail", detail, pane}
+//
+// agent carries the one fact the judge cannot recover on its own: that
+// the dialog belongs to a subagent. Only the hook payload says so, and
+// the transcript — whose format is documented as internal and unstable —
+// is not a second source worth depending on.
+func judgeArgv(self, socket, pane, detail, agent string) []string {
+	return []string{self, "judge", "-socket", socket,
+		"-detail", detail, "-agent", agent, pane}
 }
 
 // runJudgeCLI runs one triage episode and returns an exit code nobody
@@ -36,6 +42,7 @@ func runJudgeCLI(args []string) int {
 	fs.SetOutput(io.Discard)
 	socket := fs.String("socket", "coop", "tmux socket name (tmux -L)")
 	detail := fs.String("detail", "", "the triggering event's tool and command")
+	agent := fs.String("agent", "", "the subagent that triggered the event, if any")
 	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 1 {
 		return 1
 	}
@@ -74,18 +81,13 @@ func runJudgeCLI(args []string) int {
 		logf("arbiter home: %v", err)
 		return 1
 	}
-	model, allowed := hub.DefaultArbiterModel, judgeAllowedCmds(config.Config{})
-	if c, err := config.Load(cfgPath); err == nil {
-		if c.Arbiter.Model != "" {
-			model = c.Arbiter.Model
-		}
-		allowed = judgeAllowedCmds(c)
-	}
+	model, allowed := judgeConfig(cfgPath, logf)
 
 	tm := &hub.ExecTmux{Socket: *socket}
 	err = hub.Judge(tm, hub.DefaultTranscripts(), hub.JudgeReq{
 		PaneID:  pane,
 		Detail:  *detail,
+		Agent:   *agent,
 		Allowed: allowed,
 		Audit:   hub.DefaultAuditPath(),
 		Now:     time.Now,
@@ -97,6 +99,41 @@ func runJudgeCLI(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// judgeConfig resolves the model and the send gate from the config
+// file. Three cases, not two — an unparseable file is not a missing one:
+//
+//   - no file: the built-in defaults, the same as an operator who never
+//     wrote one.
+//   - a file that parses: its settings, including a present-but-empty
+//     allowed_cmds, which means send nothing.
+//   - a file that does not parse: no send gate at all, logged. The
+//     failure this closes is the operator who set allowed_cmds to []
+//     and later introduced a syntax error — or wrote "claude" where the
+//     list belongs, which fails the whole Config unmarshal. Falling back
+//     to the built-in claude,node there silently *widens* a gate the
+//     file was narrowing, which is the one direction a config error must
+//     never move. Escalating with no send gate is the same behaviour a
+//     deliberate [] asks for.
+//
+// The model is not treated the same way: a default model on a broken
+// file costs a cheaper judgement, not a wrong keystroke.
+func judgeConfig(cfgPath string, logf func(string, ...any)) (string, []string) {
+	c, err := config.Load(cfgPath)
+	switch {
+	case err == nil:
+		model := hub.DefaultArbiterModel
+		if c.Arbiter.Model != "" {
+			model = c.Arbiter.Model
+		}
+		return model, judgeAllowedCmds(c)
+	case os.IsNotExist(err):
+		return hub.DefaultArbiterModel, judgeAllowedCmds(config.Config{})
+	default:
+		logf("config: %v: judging with no send gate (escalate only)", err)
+		return hub.DefaultArbiterModel, nil
+	}
 }
 
 // judgeAllowedCmds is the pane_current_command allowlist a verdict's

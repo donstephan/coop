@@ -44,6 +44,42 @@ func TestParseHookPayloadToolFields(t *testing.T) {
 	}
 }
 
+// agent_id and agent_type are Claude Code's documented common input
+// fields, sent on every hook that fires inside a subagent and on none
+// that fires on the main thread — so parsing them is how coop knows a
+// permission dialog belongs to a sidechain rather than the session's
+// main thread.
+func TestParseHookPayloadSubagentFields(t *testing.T) {
+	p, ok := ParseHookPayload(strings.NewReader(
+		`{"hook_event_name":"PermissionRequest","session_id":"s1","agent_id":"ag_1","agent_type":"general-purpose"}`))
+	if !ok || p.AgentID != "ag_1" || p.AgentType != "general-purpose" {
+		t.Fatalf("payload = %+v ok=%v", p, ok)
+	}
+}
+
+func TestHookAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    HookPayload
+		want string
+	}{
+		{"main thread", HookPayload{Event: "PermissionRequest"}, ""},
+		{"named subagent", HookPayload{Event: "PermissionRequest",
+			AgentID: "ag_1", AgentType: "Explore"}, "Explore"},
+		// The id alone still proves the origin. Reading that as the main
+		// thread is the one wrong answer: it would hand the judge the
+		// parent's last message as this dialog's explanation.
+		{"id but no type", HookPayload{Event: "PermissionRequest", AgentID: "ag_1"}, "subagent"},
+		{"blank type", HookPayload{Event: "PermissionRequest", AgentType: "  "}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HookAgent(tc.p); got != tc.want {
+				t.Errorf("HookAgent = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // toolInput builds a HookPayload.ToolInput value in tests — the field
 // is an anonymous struct, so callers can't just write a composite
 // literal against the type by name.

@@ -124,8 +124,12 @@ answer.
 
 Every action, answered or escalated, is appended to
 `~/.local/state/coop/arbiter-audit.jsonl` — a durable record coop itself
-never reads. Failures and anything the model returned that coop couldn't
-use land in `~/.local/state/coop/judge.log` beside it.
+never reads. `~/.local/state/coop/judge.log` beside it is the diagnostic
+one: a line per episode saying which pane it was, whether the screen it
+captured actually showed a dialog, which subagent asked (if any) and what
+the verdict was, plus failures and anything the model returned that coop
+couldn't use. It records the shape of an episode, never the screen text,
+and it is never rotated.
 
 The arbiter has no hands and no CLI to reach for: it runs with an empty
 tool set (`--tools ""`), so "it only reads a screen and answers" is
@@ -142,7 +146,9 @@ whatever opened next.
 
 Those gates are yours, so coop reads them only from your files: the
 allowlist is `arbiter.allowed_cmds` in `config.json` (an empty list means
-"send nothing"), the policy is `~/.config/coop/arbiter.md`, and the judge
+"send nothing", and a `config.json` that doesn't parse means the same —
+a broken file never hands back permission you'd taken away, it just says
+so in `judge.log`), the policy is `~/.config/coop/arbiter.md`, and the judge
 runs with a constructed environment — a `PATH` built from where coop
 itself is installed plus the system directories, a `HOME` from the
 password database, and nothing else through except locale, timezone and
@@ -167,8 +173,14 @@ If your Anthropic auth lives in environment variables, put it in
 `~/.claude/settings.json`'s `env` block instead — the judge does not
 inherit `ANTHROPIC_*` from anywhere.
 
+When the dialog belongs to a subagent rather than the session's main
+thread, the judge is told so by name. It still sees the main thread's
+last message — that's the plan the subagent was dispatched under — but
+labelled as the main thread's, so a `Bash` prompt from an `Explore`
+agent isn't judged against whatever the parent happened to be narrating.
+
 `coop peek <session>` survives as a debug aid for you: it prints a
-session's screen and its last assistant turn, the same context the
+session's screen and its last assistant turn, most of the context the
 arbiter is handed.
 
 ## Config

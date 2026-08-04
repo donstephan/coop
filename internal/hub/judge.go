@@ -34,15 +34,36 @@ type Verdict struct {
 // omitted rather than left empty so a missing transcript doesn't read as
 // an assistant that said nothing. Everything here is untrusted data from
 // the monitored session — the preamble (arbiterPreamble) is what says so.
-func buildJudgePrompt(session, detail, screen, lastMsg string) string {
+//
+// agent is the subagent the request came from ("" for the main thread),
+// and it changes what the last assistant message *means*: LastText skips
+// sidechain turns, so for a subagent's dialog that message is the
+// parent's narration ("dispatching review") and not a word about what
+// the subagent asked for. It stays in the prompt — the main thread's
+// plan is the context the subagent was dispatched under — but under a
+// heading that says whose it is, because presented unlabelled it reads
+// as an explanation of this request and the judge escalates on
+// "unclear what that entails" every time. The name is sanitized and
+// quoted like every other untrusted field: it comes from the payload,
+// and a plausible-looking instruction wearing an agent_type is still
+// data.
+func buildJudgePrompt(session, detail, screen, lastMsg, agent string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "session: %q\n", session)
+	if agent = sanitizeNote(agent); agent != "" {
+		fmt.Fprintf(&b, "requested by: %q subagent of this session\n", agent)
+	}
 	if detail = sanitizeNote(detail); detail != "" {
 		fmt.Fprintf(&b, "trigger: %s\n", detail)
 	}
 	fmt.Fprintf(&b, "\n=== screen ===\n%s\n", strings.TrimRight(screen, "\n"))
 	if lastMsg = strings.TrimSpace(lastMsg); lastMsg != "" {
-		fmt.Fprintf(&b, "\n=== last assistant message ===\n%s\n", lastMsg)
+		if agent != "" {
+			fmt.Fprintf(&b, "\n=== last assistant message (the main thread's, not the %q subagent that made this request) ===\n%s\n",
+				agent, lastMsg)
+		} else {
+			fmt.Fprintf(&b, "\n=== last assistant message ===\n%s\n", lastMsg)
+		}
 	}
 	return b.String()
 }
@@ -108,8 +129,12 @@ func firstJSONObject(s string) (json.RawMessage, bool) {
 // JudgeReq is one judging episode. Run is injected so tests never spawn
 // a process; Log is where diagnostics go (nil for none).
 type JudgeReq struct {
-	PaneID  string
-	Detail  string   // NudgeDetail of the triggering event, "" when there was none
+	PaneID string
+	Detail string // NudgeDetail of the triggering event, "" when there was none
+	// Agent is HookAgent of the triggering event: the subagent that
+	// asked, "" for the main thread. It only ever labels the prompt —
+	// no gate reads it.
+	Agent   string
 	Allowed []string // pane_current_command allowlist, same gate as the TUI's
 	Audit   string   // audit log path
 	// Now is read at the moment an action lands, not when the episode
@@ -180,7 +205,8 @@ func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
 			last = text
 		}
 	}
-	prompt := buildJudgePrompt(p.Session, req.Detail, StripANSI(screen), last)
+	plain := StripANSI(screen)
+	prompt := buildJudgePrompt(p.Session, req.Detail, plain, last, req.Agent)
 	out, err := req.Run(prompt)
 	if err != nil {
 		return err
@@ -190,6 +216,17 @@ func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
 		req.logf("verdict: %v (raw: %q)", err, out)
 		return err
 	}
+	// One line per episode, whatever the outcome — the judge log used to
+	// hold failures only, and "escalated: cannot see the dialog" was then
+	// indistinguishable from a capture that genuinely showed none. dialog
+	// is the same predicate Answer's gate uses, so a verdict blaming the
+	// screen can be checked against what that gate saw. Deliberately a
+	// summary and not the screen itself: capture output is untrusted and
+	// a terminal's worth of it per episode would bury the log it is
+	// meant to make readable.
+	req.logf("episode %s %q: dialog=%v agent=%q verdict=%s (%s)",
+		p.ID, p.Session, NeedsInputScreen(plain), sanitizeNote(req.Agent),
+		v.Action, sanitizeNote(v.Reason))
 	return applyVerdict(tm, *p, since, mode, v, req)
 }
 

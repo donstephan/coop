@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -210,10 +211,31 @@ func ClaudeJudgeRunner(dir, model, systemPrompt string) func(string) (string, er
 		cmd.Stdin = strings.NewReader(prompt)
 		out, err := cmd.Output()
 		if err != nil {
-			return "", err
+			return "", judgeRunError(err)
 		}
 		return string(out), nil
 	}
+}
+
+// judgeRunError folds a failed claude run's stderr into the error.
+// cmd.Output parks it in (*exec.ExitError).Stderr, where nothing read it
+// — so a claude that refused to start (bad model id, no credentials)
+// logged "exit status 1" and nothing more, and the judge is detached
+// with both its own streams on /dev/null, making judge.log the only
+// channel it has. sanitizeNote does the bounding: one line, no control
+// bytes (the log gets read with cat, and an ANSI escape from a failing
+// child is a terminal-injection vector) and capped, so a node stack
+// trace cannot append a screenful per episode.
+func judgeRunError(err error) error {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return err
+	}
+	msg := sanitizeNote(string(ee.Stderr))
+	if msg == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, msg)
 }
 
 // judgeClaudeArgs is one episode's claude command line, kept apart from

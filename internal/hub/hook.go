@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,31 @@ type HookPayload struct {
 	ToolInput      struct {
 		Command string `json:"command"`
 	} `json:"tool_input"`
+
+	// Subagent origin. Both are documented common input fields, sent on
+	// every hook that fires inside a Task sidechain and on none that
+	// fires on the main thread — so their presence is the fact the judge
+	// needs: the transcript's last assistant message is the *parent's*
+	// (Transcripts.LastText skips sidechain turns), and captioning a
+	// subagent's dialog with it reads as an explanation of a request it
+	// has nothing to do with.
+	AgentID   string `json:"agent_id"`
+	AgentType string `json:"agent_type"`
+}
+
+// HookAgent names the subagent an event came from, "" for the main
+// thread. agent_type is the name worth showing ("general-purpose",
+// "Explore"); agent_id alone still proves the origin, so it degrades to
+// a bare word rather than back to "main thread" — the one wrong answer
+// here is claiming a sidechain's dialog belongs to the parent.
+func HookAgent(p HookPayload) string {
+	if t := strings.TrimSpace(p.AgentType); t != "" {
+		return t
+	}
+	if strings.TrimSpace(p.AgentID) != "" {
+		return "subagent"
+	}
+	return ""
 }
 
 // ParseHookPayload decodes one hook invocation's stdin. false for

@@ -1,7 +1,9 @@
 package hub
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -68,6 +70,65 @@ func TestJudgeClaudeArgsRunNoTools(t *testing.T) {
 	if strings.Contains(joined, "--settings") {
 		t.Error("the judge must register none of coop's hooks")
 	}
+}
+
+// A failing claude's stderr is the whole diagnosis — the judge is
+// detached with both its streams on /dev/null, so judge.log is the only
+// channel it has, and cmd.Output parks stderr where nothing read it.
+// The child here is /bin/sh, never claude and never coop judge: what is
+// under test is the plumbing from Output's ExitError to the message.
+func TestJudgeRunErrorCarriesStderr(t *testing.T) {
+	err := failingChild(t, "printf 'Invalid model name\\n' >&2; exit 1")
+	got := judgeRunError(err).Error()
+	if !strings.Contains(got, "Invalid model name") {
+		t.Errorf("error %q dropped the child's stderr", got)
+	}
+	if !strings.Contains(got, "exit status 1") {
+		t.Errorf("error %q lost the exit status", got)
+	}
+}
+
+// A child that writes a stack trace per line must not append a screenful
+// to the log for every episode, and must not smuggle control bytes into
+// a file a human reads with cat.
+func TestJudgeRunErrorBoundsStderr(t *testing.T) {
+	err := failingChild(t,
+		`i=0; while [ $i -lt 200 ]; do printf 'boom \033[2Jboom\n' >&2; i=$((i+1)); done; exit 1`)
+	got := judgeRunError(err).Error()
+	if len([]rune(got)) > noteMax+64 {
+		t.Errorf("error is %d runes, want it bounded near noteMax", len([]rune(got)))
+	}
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("an escape byte reached the judge log: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("error spans lines, one log line per episode is the contract: %q", got)
+	}
+}
+
+// An error that is not an ExitError (claude missing, timeout) passes
+// through untouched — there is no stderr to add and the wrapping would
+// only obscure it.
+func TestJudgeRunErrorPassesOtherErrorsThrough(t *testing.T) {
+	want := errors.New("claude not found in /usr/bin")
+	if got := judgeRunError(want); got != want {
+		t.Errorf("judgeRunError rewrote a non-exec error: %v", got)
+	}
+}
+
+// failingChild runs one sh script through cmd.Output and returns the
+// error, which is how ClaudeJudgeRunner obtains its own.
+func failingChild(t *testing.T, script string) error {
+	t.Helper()
+	sh, lookErr := exec.LookPath("sh")
+	if lookErr != nil {
+		t.Skip("no sh on this platform")
+	}
+	_, err := exec.Command(sh, "-c", script).Output()
+	if err == nil {
+		t.Fatal("the child was supposed to fail")
+	}
+	return err
 }
 
 // claimsIn points the claims directory at dir for one test. Not an

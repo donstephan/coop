@@ -104,7 +104,12 @@ func spawnJudge(tm judgeTmux, socket, pane string, p hub.HookPayload) {
 	if err != nil {
 		return
 	}
-	argv := judgeArgv(self, socket, pane, hub.NudgeDetail(p))
+	// NudgeDetail stays the tool call and nothing else — the judge prompt
+	// renders it after "trigger:", where everything to the end of the
+	// line is the monitored session's own text. The subagent rides in its
+	// own argument instead of being glued on, so that boundary keeps
+	// meaning exactly one thing.
+	argv := judgeArgv(self, socket, pane, hub.NudgeDetail(p), hub.HookAgent(p))
 	if !claimEpisode(pane, since) {
 		return
 	}

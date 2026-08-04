@@ -2,6 +2,9 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -22,9 +25,9 @@ func TestIsJudgeCmd(t *testing.T) {
 }
 
 func TestJudgeArgvShape(t *testing.T) {
-	got := judgeArgv("/usr/local/bin/coop", "coop", "%1", "Bash: go test ./...")
+	got := judgeArgv("/usr/local/bin/coop", "coop", "%1", "Bash: go test ./...", "Explore")
 	want := []string{"/usr/local/bin/coop", "judge", "-socket", "coop",
-		"-detail", "Bash: go test ./...", "%1"}
+		"-detail", "Bash: go test ./...", "-agent", "Explore", "%1"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -61,6 +64,74 @@ func TestJudgeAllowedCmds(t *testing.T) {
 				t.Errorf("judgeAllowedCmds(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// A judge whose config file is present but unparseable must not regain
+// the built-in send gate: an operator who wrote allowed_cmds [] ("never
+// send") and later broke the JSON — or wrote a bare string where the
+// list belongs, which fails the whole Config unmarshal — would otherwise
+// have every judge silently answering dialogs again, with nothing in the
+// log to say so.
+func TestJudgeConfigFailsClosedOnAnUnparseableFile(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"syntax error", `{"arbiter": {"allowed_cmds": []},}`},
+		{"string where a list belongs", `{"arbiter": {"allowed_cmds": "claude"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var logged []string
+			model, allowed := judgeConfig(path, func(f string, a ...any) {
+				logged = append(logged, fmt.Sprintf(f, a...))
+			})
+			if allowed != nil {
+				t.Errorf("allowed = %v, want no send gate at all", allowed)
+			}
+			if model != hub.DefaultArbiterModel {
+				t.Errorf("model = %q, want the default", model)
+			}
+			if len(logged) == 0 {
+				t.Error("an unparseable config must say so in the judge log")
+			}
+		})
+	}
+}
+
+// A config that is simply absent is not an error: the operator never
+// wrote one, and the built-in defaults are what they get.
+func TestJudgeConfigMissingFileFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	var logged []string
+	model, allowed := judgeConfig(path, func(f string, a ...any) {
+		logged = append(logged, fmt.Sprintf(f, a...))
+	})
+	if !slices.Equal(allowed, []string{"claude", "node"}) {
+		t.Errorf("allowed = %v, want the built-in list", allowed)
+	}
+	if model != hub.DefaultArbiterModel {
+		t.Errorf("model = %q, want the default", model)
+	}
+	if len(logged) != 0 {
+		t.Errorf("a missing config is not a failure worth logging: %v", logged)
+	}
+}
+
+// A file that parses is obeyed, including the empty list that means
+// "never send".
+func TestJudgeConfigHonoursTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"arbiter": {"model": "sonnet", "allowed_cmds": []}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	model, allowed := judgeConfig(path, func(string, ...any) {})
+	if model != "sonnet" || allowed != nil {
+		t.Errorf("model = %q allowed = %v, want sonnet and no send gate", model, allowed)
 	}
 }
 
@@ -253,6 +324,41 @@ func TestSpawnJudgeArgvCarriesSocketAndDetail(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("argv %q missing %q", got, want)
 		}
+	}
+}
+
+// The subagent an event came from only exists in the hook payload — the
+// judge cannot recover it from the transcript, whose format is
+// documented as internal and unstable — so the spawn has to carry it,
+// and a main-thread request must carry nothing.
+func TestSpawnJudgeArgvCarriesTheSubagent(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		p          hub.HookPayload
+	}{
+		{"subagent", "general-purpose", func() hub.HookPayload {
+			p := permissionRequest()
+			p.AgentID, p.AgentType = "ag_1", "general-purpose"
+			return p
+		}()},
+		{"main thread", "", permissionRequest()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClaims(t)
+			argvs := captureSpawns(t, nil)
+			spawnJudge(waitingTmux(hub.ArbiterModeFull), "coop", "%1", tc.p)
+			if len(*argvs) != 1 {
+				t.Fatalf("spawned %d judges", len(*argvs))
+			}
+			argv := (*argvs)[0]
+			i := slices.Index(argv, "-agent")
+			if i < 0 || i+1 >= len(argv) {
+				t.Fatalf("argv %v has no -agent", argv)
+			}
+			if argv[i+1] != tc.want {
+				t.Errorf("-agent %q, want %q", argv[i+1], tc.want)
+			}
+		})
 	}
 }
 
