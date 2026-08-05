@@ -142,8 +142,12 @@ type JudgeReq struct {
 	// stamped up front would date every audit line up to a minute early.
 	// nil means time.Now.
 	Now func() time.Time
-	Run func(prompt string) (string, error)
-	Log func(format string, args ...any)
+	// Wait is the pause between capture attempts while the dialog paints
+	// (see captureDialog). nil means time.Sleep; tests pass a counter so
+	// the bound is asserted without spending the wall clock on it.
+	Wait func(time.Duration)
+	Run  func(prompt string) (string, error)
+	Log  func(format string, args ...any)
 }
 
 func (r JudgeReq) logf(format string, args ...any) {
@@ -157,6 +161,62 @@ func (r JudgeReq) now() time.Time {
 		return r.Now()
 	}
 	return time.Now()
+}
+
+func (r JudgeReq) wait(d time.Duration) {
+	if r.Wait != nil {
+		r.Wait(d)
+		return
+	}
+	time.Sleep(d)
+}
+
+// The judge is spawned from the hook that announces the dialog, and
+// PermissionRequest fires *before* Claude Code renders one — a hook may
+// decide the permission itself, so the paint waits for every hook to
+// return. A capture taken the moment the judge starts is therefore
+// racing a screen that has not been drawn yet, and losing that race is
+// not a stale row: the model is handed a real trigger beside a screen
+// with no dialog on it and escalates with "no numbered dialog is visible
+// on screen to confirm", which reads as a judgement about the command.
+//
+// So the capture retries. Each attempt is one capture-pane, and the
+// whole bound is a fraction of the model turn it precedes, so the wait
+// costs nothing next to the call it is protecting.
+const (
+	dialogAttempts = 6
+	dialogDelay    = 200 * time.Millisecond
+)
+
+// captureDialog captures the pane, retrying until the dialog is on
+// screen or the attempts run out. ok is false when the episode ended
+// while waiting.
+//
+// A dialog that never arrives is still judged: an escalation over a
+// screen that genuinely showed none is the honest outcome, and the
+// episode's dialog= line is what tells that apart from a verdict
+// blaming the screen. Only an answered dialog is dropped.
+func captureDialog(tm Tmux, pane string, req JudgeReq) (screen string, ok bool, err error) {
+	for i := 0; ; i++ {
+		if screen, err = tm.CapturePane(pane); err != nil {
+			return "", false, err
+		}
+		if NeedsInputScreen(screen) || i == dialogAttempts-1 {
+			return screen, true, nil
+		}
+		req.wait(dialogDelay)
+		// The human now has the whole wait to answer in, and judging a
+		// dialog they have moved past spends a model turn to park a note
+		// on a row ApplyHook has already retired. Re-read the one option
+		// that says so rather than the whole pane list. Only a status
+		// that positively says otherwise ends the wait: a failed read and
+		// an unset option are both "don't know", and reading either as an
+		// answer would abandon every episode after one attempt — which is
+		// the whole race, restored.
+		if s, err := tm.PaneOption(pane, ClaudeStatusMarker); err == nil && s != "" && s != "waiting" {
+			return "", false, nil
+		}
+	}
 }
 
 // Judge runs one episode end to end: re-check the mode and the pane,
@@ -190,9 +250,12 @@ func Judge(tm Tmux, tr *Transcripts, req JudgeReq) error {
 	if p.Claude == nil || p.Claude.Status != "waiting" {
 		return nil
 	}
-	screen, err := tm.CapturePane(p.ID)
+	screen, ok, err := captureDialog(tm, p.ID, req)
 	if err != nil {
 		return err
+	}
+	if !ok {
+		return nil // answered while the dialog was still painting
 	}
 	last := ""
 	if c := p.Claude; tr != nil && c.SessionID != "" {

@@ -257,7 +257,7 @@ func drive(t *testing.T, m Model, cmd tea.Cmd) Model {
 
 func pollOnce(t *testing.T, f *fakeTmux) Model {
 	t.Helper()
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	return drive(t, m, m.poll())
 }
 
@@ -282,7 +282,7 @@ func livePanes() []hub.Pane {
 // Returns the settled model.
 func bootLive(t *testing.T, f *fakeTmux) Model {
 	t.Helper()
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m, cmd := driveCmd(t, m, m.poll()) // pollMsg → ensure cmd
 	m, cmd = driveCmd(t, m, cmd)       // livePaneMsg → retarget cmd
 	m, _ = driveCmd(t, m, cmd)         // retargetMsg
@@ -304,7 +304,7 @@ func TestPollUsesClaudeState(t *testing.T) {
 			Claude: &hub.ClaudeState{SessionID: "abc", Status: "busy"}},
 		{Session: "other", ID: "%2", PID: 99, Title: "⠂ working", Cmd: "claude"},
 	}}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m = drive(t, m, m.poll())
 	if m.panes[0].Status != hub.StatusWorking {
 		t.Errorf("pane with published state: Status = %v, want working", m.panes[0].Status)
@@ -579,7 +579,7 @@ func TestPollSkipsTranscriptsWhenColumnOff(t *testing.T) {
 	panes := testPanes()
 	panes[1].Claude = &hub.ClaudeState{SessionID: "abc", Status: "idle"}
 	f := &fakeTmux{panes: panes}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	asked := 0
 	m.transcripts = func(sessionID, cwd string) (hub.TranscriptStats, bool) {
 		asked++
@@ -651,7 +651,7 @@ func TestWindowSizePinsNavWidth(t *testing.T) {
 // arrives, then chain into the preview attach.
 func TestLivePaneMsgPinsNavThenRetargets(t *testing.T) {
 	f := &fakeTmux{panes: livePanes(), marked: "%50"}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "%0", "claude", nil, nil, 0)
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "%0", "claude", nil, nil, nil, 0)
 	m, cmd := driveCmd(t, m, m.poll()) // pollMsg → ensure cmd
 	m, cmd = driveCmd(t, m, cmd)       // livePaneMsg → resizeSelf cmd
 	m, cmd = driveCmd(t, m, cmd)       // resizedMsg → retarget cmd
@@ -1886,7 +1886,7 @@ func TestLiveTitleForTaskText(t *testing.T) {
 // newPicker builds a model with a canned repo loader and one poll done.
 func newPicker(t *testing.T, f *fakeTmux, repos []string) Model {
 	t.Helper()
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude",
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil,
 		func() ([]string, error) { return repos, nil }, nil, 0)
 	return drive(t, m, m.poll())
 }
@@ -2120,6 +2120,39 @@ func TestCreateTriggersImmediatePoll(t *testing.T) {
 	}
 }
 
+// createCmd must wrap the session command with the injected toolboxCmd,
+// capturing it by value into the tea.Cmd closure like tm/cmd/live already
+// are — the Model itself never does the wrapping.
+func TestCreateCmdAppliesToolbox(t *testing.T) {
+	tm := &fakeTmux{}
+	m := New(tm, nil, "roost", "cc", "%0", "claude",
+		func(dir, cmd string) string { return "env PATH=" + dir + "/bin " + cmd },
+		func() ([]string, error) { return []string{"/home/user/sprocket-v2"}, nil },
+		func(string) (string, error) { return "", nil }, 0)
+	cmd := m.createCmd("sprocket-v2", "/home/user/sprocket-v2")
+	if msg, ok := cmd().(createdMsg); !ok || msg.err != nil {
+		t.Fatalf("createCmd = %#v", cmd())
+	}
+	got := tm.created[0][2]
+	want := "env PATH=/home/user/sprocket-v2/bin claude"
+	if got != want {
+		t.Errorf("session command = %q, want %q", got, want)
+	}
+}
+
+// A nil toolboxCmd — every existing caller — must leave the command
+// untouched, since New substitutes an identity function for it.
+func TestCreateCmdWithoutToolbox(t *testing.T) {
+	tm := &fakeTmux{}
+	m := New(tm, nil, "roost", "cc", "%0", "claude", nil,
+		func() ([]string, error) { return nil, nil },
+		func(string) (string, error) { return "", nil }, 0)
+	m.createCmd("alpha", "/home/user/alpha")()
+	if got := tm.created[0][2]; got != "claude" {
+		t.Errorf("nil toolboxCmd must not alter the command: %q", got)
+	}
+}
+
 // createGamma runs the picker create flow on a booted-live model and
 // returns it with the createdMsg handled — cmd is the immediate poll.
 func createGamma(t *testing.T, f *fakeTmux, m Model) (Model, tea.Cmd) {
@@ -2176,7 +2209,7 @@ func TestKeypressCancelsCreateAutoFocus(t *testing.T) {
 
 func TestPickerConfigErrors(t *testing.T) {
 	f := &fakeTmux{panes: testPanes()}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude",
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil,
 		func() ([]string, error) { return nil, fmt.Errorf("boom: no config") },
 		nil, 0)
 	m = drive(t, m, m.poll())
@@ -2445,7 +2478,7 @@ func TestPollShowsDoneAndPreviewFocusClears(t *testing.T) {
 		}
 	}
 	f := &fakeTmux{panes: pane("⠂ compiling")}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil,
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, nil,
 		5*time.Minute)
 	m = drive(t, m, m.poll())
 
@@ -2484,7 +2517,7 @@ func TestPollPrimaryClientClearsDone(t *testing.T) {
 		}
 	}
 	f := &fakeTmux{panes: pane("⠂ compiling")}
-	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil,
+	m := New(f, []string{"claude", "node"}, "roost", "cc", "", "claude", nil, nil, nil,
 		5*time.Minute)
 	m = drive(t, m, m.poll())
 
@@ -2498,7 +2531,7 @@ func TestPollPrimaryClientClearsDone(t *testing.T) {
 
 func TestArbiterKeyCycle(t *testing.T) {
 	f := &fakeTmux{}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	for _, tc := range []struct{ from, want string }{
 		{hub.ArbiterModeOff, hub.ArbiterModeRecommend},
 		{hub.ArbiterModeRecommend, hub.ArbiterModeOff},
@@ -2551,7 +2584,7 @@ func TestPollCarriesArbiterModeIntoModel(t *testing.T) {
 }
 
 func TestArbiterHintShowsMode(t *testing.T) {
-	m := New(&fakeTmux{}, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(&fakeTmux{}, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m.arbiterMode = hub.ArbiterModeRecommend
 	if got := m.arbiterHint(); got != "a arbiter recommend" {
 		t.Errorf("got %q", got)
@@ -2563,7 +2596,7 @@ func TestArbiterHintShowsMode(t *testing.T) {
 }
 
 func TestArbiterFooterDetail(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: "asking to run tests — suggest 1"}}
 	m.selectedID = "%1"
@@ -2582,7 +2615,7 @@ func TestArbiterFooterDetail(t *testing.T) {
 // digit keys use, and advertises itself only on a row that has one.
 func TestSpaceAppliesArbiterSuggestion(t *testing.T) {
 	f := &fakeTmux{cmd: "claude"}
-	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(f, []string{"claude"}, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1", Status: hub.StatusNeedsInput,
 		ArbiterNote: "asking to run tests", ArbiterSuggest: "2"}}
 	m.selectedID = "%1"
@@ -2620,7 +2653,7 @@ func TestSpaceAppliesArbiterSuggestion(t *testing.T) {
 // its only remaining visible trace on an ordinary row now that there is
 // no arbiter row of its own.
 func TestArbiterRowMark(t *testing.T) {
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: "note"}}
 	m.selectedID = "%1"
@@ -2682,7 +2715,7 @@ const longNote = "Approval to run a python3 script regenerating the golden " +
 
 func msgBoxModel(t *testing.T, note string) Model {
 	t.Helper()
-	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, 0)
+	m := New(&fakeTmux{}, nil, "roost", "cc", "", "claude", nil, nil, nil, 0)
 	m.width, m.height = navWidth, 40
 	m.panes = []hub.Pane{{Session: "alpha", ID: "%1",
 		Status: hub.StatusNeedsInput, ArbiterNote: note}}

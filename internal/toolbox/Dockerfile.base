@@ -1,0 +1,44 @@
+# internal/toolbox/Dockerfile.base
+#
+# coop's default toolbox image. Embedded in the coop binary and built on
+# first use — no registry, no second repo to keep in sync.
+#
+# debian-slim, not alpine: musl breaks enough pip wheels that alpine would
+# manufacture exactly the "why won't this install" problem this exists to
+# remove.
+#
+# Contents are generic and carry no compilers. A repo commits its whole
+# toolchain to the container deliberately, in .coop/tools.Dockerfile, or
+# not at all — see the "all-in or all-out" rule in the design doc.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl git gh jq make python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# The container IS the environment: there is no host Python for Debian's
+# PEP 668 marker to protect, and leaving it in place makes every
+# pip install in an overlay or a session fail with
+# "externally-managed-environment".
+RUN rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
+
+# The manifest: exactly the commands coop generates shims for. Core file
+# utilities are deliberately absent — each shim costs ~30-80ms of exec
+# startup, and claude reaches for its own Grep/Glob tools for that work
+# anyway, which run on the host regardless.
+#
+# git, gh and make are installed and deliberately *not* shimmed. gh in
+# here has neither ~/.config/gh nor GH_TOKEN (the environment allowlist
+# passes neither), so shimming it by default would turn a working
+# "gh pr list" into "please run: gh auth login" on every zero-config
+# repo. make orchestrates a whole build, and this image ships no
+# compilers on purpose — shimming it by default is exactly the split
+# toolchain the all-in-or-all-out rule exists to prevent, applied with no
+# opt-in. A repo that wants either shims it in its own overlay, where
+# that is a decision and the overlay can supply what it needs.
+RUN mkdir -p /etc/coop \
+    && printf '%s\n' python3 pip3 jq curl > /etc/coop/tools
+
+# No cache environment here on purpose: the cache variables must point
+# under $HOME, and $HOME is the per-repo toolbox home, known only at run
+# time. RunArgs sets them (Task 7).

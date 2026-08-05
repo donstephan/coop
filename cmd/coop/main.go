@@ -200,6 +200,12 @@ func main() {
 		os.Exit(runJudgeCLI(os.Args[1:]))
 	}
 
+	// The shim's target, called once per shimmed command. Dispatched
+	// before flags for the same reason coop hook is: it must be cheap.
+	if isToolsCmd(os.Args[1:]) {
+		os.Exit(runToolsCLI(os.Args[1:], os.Stdout, os.Stderr))
+	}
+
 	socket := flag.String("socket", envOr("COOP_SOCKET", "coop"),
 		"tmux socket name (tmux -L)")
 	cmds := flag.String("allowed-cmds", envOr("COOP_ALLOWED_CMDS", hub.DefaultAllowedCmds),
@@ -281,8 +287,19 @@ func main() {
 	addRepo := func(repo string) (string, error) {
 		return config.AddRepo(*configPath, repo)
 	}
+	// The toolbox: the shim directory goes on the new session's PATH
+	// immediately, while the image build and shim generation run in the
+	// background. A PATH entry naming a briefly empty directory is
+	// harmless — a command in that window finds the host's tool, as it
+	// would today.
+	toolboxCmd := func(dir, cmd string) string { return cmd }
+	if tc, err := newToolboxCmd(*configPath); err != nil {
+		fmt.Fprintln(os.Stderr, "coop: toolbox:", err)
+	} else if tc != nil {
+		toolboxCmd = tc
+	}
 	m := tui.New(tm, splitCmds(*cmds), hubSession, *socket,
-		os.Getenv("TMUX_PANE"), launchCmd, loadRepos, addRepo, ttl)
+		os.Getenv("TMUX_PANE"), launchCmd, toolboxCmd, loadRepos, addRepo, ttl)
 	final, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(),
 		tea.WithMouseCellMotion()).Run()
 	if fm, ok := final.(tui.Model); ok {

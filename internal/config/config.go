@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Config is ~/.config/coop/config.json. Unknown keys are ignored —
@@ -24,6 +25,15 @@ type Config struct {
 	Arbiter struct {
 		Model string `json:"model"` // claude model id/alias; "" = sonnet
 	} `json:"arbiter"`
+	// Toolbox configures the per-repo tooling container.
+	Toolbox struct {
+		// Enabled is a pointer so an absent key ("") differs from an
+		// explicit false: absent means on, since an absent docker
+		// already disables the feature in practice.
+		Enabled     *bool  `json:"enabled"`
+		Engine      string `json:"engine"`       // "" = docker
+		IdleTimeout string `json:"idle_timeout"` // "" = 30m; "0" = never
+	} `json:"toolbox"`
 }
 
 // DefaultPath is ~/.config/coop/config.json ("" if home is unknown).
@@ -50,6 +60,46 @@ func Load(path string) (Config, error) {
 		c.Repos[i] = expandHome(r)
 	}
 	return c, nil
+}
+
+// DefaultToolboxIdle is how long a container sits with nothing running
+// before it exits itself.
+const DefaultToolboxIdle = 30 * time.Minute
+
+// ToolboxEnabled reports whether the toolbox is on. An absent key means
+// on: the feature costs nothing on a machine with no container engine,
+// because shim generation fails open there.
+func (c Config) ToolboxEnabled() bool {
+	return c.Toolbox.Enabled == nil || *c.Toolbox.Enabled
+}
+
+// ToolboxEngine is the container CLI to shell out to.
+func (c Config) ToolboxEngine() string {
+	if c.Toolbox.Engine == "" {
+		return "docker"
+	}
+	return c.Toolbox.Engine
+}
+
+// ToolboxIdle parses idle_timeout. "0" disables reaping; an unparseable
+// value is an error rather than a silent default, since a container that
+// never exits is a leak the operator did not ask for.
+func (c Config) ToolboxIdle() (time.Duration, error) {
+	s := strings.TrimSpace(c.Toolbox.IdleTimeout)
+	if s == "" {
+		return DefaultToolboxIdle, nil
+	}
+	if s == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("toolbox.idle_timeout: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("toolbox.idle_timeout: %q is negative", s)
+	}
+	return d, nil
 }
 
 // AddRepo appends repo to the config's "repos" list and returns the

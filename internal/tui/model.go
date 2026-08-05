@@ -106,7 +106,12 @@ type Model struct {
 	pendingSession string // session to auto-select when it appears
 	focusPending   bool   // focus the preview once it shows the new session
 	claudeCmd      string
-	loadRepos      func() ([]string, error)
+	// toolboxCmd wraps a new session's command with the repo's shim
+	// directory on PATH. Injected so the Model itself stays free of
+	// container knowledge, and nil-safe so every existing test can pass
+	// nil.
+	toolboxCmd func(dir, cmd string) string
+	loadRepos  func() ([]string, error)
 	// addRepo writes a repo into the config and returns the directory it
 	// resolved to; nil when there is no config to write.
 	addRepo func(repo string) (string, error)
@@ -118,12 +123,17 @@ type Model struct {
 }
 
 func New(tm hub.Tmux, allowed []string, hubSession, socket, selfPane string,
-	claudeCmd string, loadRepos func() ([]string, error),
+	claudeCmd string, toolboxCmd func(dir, cmd string) string,
+	loadRepos func() ([]string, error),
 	addRepo func(string) (string, error),
 	doneTTL time.Duration) Model {
+	if toolboxCmd == nil {
+		toolboxCmd = func(_, cmd string) string { return cmd }
+	}
 	return Model{tmux: tm, allowed: allowed, hubSession: hubSession,
 		socket: socket, selfPane: selfPane, claudeCmd: claudeCmd,
-		loadRepos: loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
+		toolboxCmd: toolboxCmd,
+		loadRepos:  loadRepos, addRepo: addRepo, done: hub.NewDoneTracker(doneTTL, tm),
 		notify:      hub.NewNotifyTracker(tm),
 		transcripts: hub.DefaultTranscripts().Stats,
 		arbiterMode: hub.ArbiterModeOff,
@@ -1084,12 +1094,13 @@ func (m Model) sessionNames() []string {
 // tiny in the preview. Best-effort: 0,0 falls back to tmux's default.
 func (m Model) createCmd(name, dir string) tea.Cmd {
 	tm, cmd, live := m.tmux, m.claudeCmd, m.livePane
+	wrap := m.toolboxCmd
 	return func() tea.Msg {
 		w, h := 0, 0
 		if live != "" {
 			w, h, _ = tm.PaneSize(live)
 		}
-		return createdMsg{err: tm.NewSession(name, dir, cmd, w, h)}
+		return createdMsg{err: tm.NewSession(name, dir, wrap(dir, cmd), w, h)}
 	}
 }
 

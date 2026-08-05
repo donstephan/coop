@@ -183,6 +183,22 @@ agent isn't judged against whatever the parent happened to be narrating.
 session's screen and its last assistant turn, most of the context the
 arbiter is handed.
 
+## Toolbox
+
+A repo can declare the command-line tooling its sessions need — a python
+with the right libraries, `mongosh`, a pinned `terraform` — in a
+`.coop/tools.Dockerfile` beside its code, and coop puts that tooling on
+the session's `PATH` through transparent shims backed by one container
+per repo. The repo is mounted at its own host path, so a traceback, a
+config file's absolute path and anything claude then opens with `Read`
+all name the same file; the container starts on the first command that
+uses it and exits itself when it has been idle. With no config at all a
+session gets `python3`, `pip3`, `jq`, `gh`, `curl` and `make` from the
+base image; with no docker installed nothing changes at all. It is a
+reproducible toolchain and a clean host, **not** a sandbox — the repo is
+mounted read-write and the container runs as you. See
+[docs/toolbox.md](docs/toolbox.md).
+
 ## Config
 
 | Flag | Env | Default | Meaning |

@@ -172,8 +172,12 @@ func runOK(result string) func(string) (string, error) {
 }
 
 func baseReq(run func(string) (string, error)) JudgeReq {
+	// Wait is stubbed for every judge test: a screen with no dialog on it
+	// now costs captureDialog's full bound in real time, and the tests
+	// that care about the bound assert on the stub instead.
 	return JudgeReq{PaneID: "%1", Detail: "Bash: go test ./...", Audit: "",
-		Now: func() time.Time { return time.Unix(1700000500, 0) }, Run: run}
+		Now:  func() time.Time { return time.Unix(1700000500, 0) },
+		Wait: func(time.Duration) {}, Run: run}
 }
 
 // An "answer" verdict is still the strongest signal the model can send —
@@ -348,6 +352,82 @@ func TestJudgeSkipsWhenNoLongerWaiting(t *testing.T) {
 	}
 	if called {
 		t.Error("a pane that stopped waiting must not be judged")
+	}
+}
+
+// A judge that captures the instant it starts races the paint it was
+// spawned to look at: PermissionRequest fires *before* Claude Code shows
+// the dialog, because a hook is allowed to decide the permission and
+// stop it being shown at all. Losing that race is not a stale row — the
+// model gets a real trigger next to a screen with no dialog on it, and
+// escalates with "no numbered dialog is visible on screen to confirm"
+// over a command it had otherwise called approvable.
+func TestJudgeWaitsForTheDialogToRender(t *testing.T) {
+	f := judgeFake(ArbiterModeRecommend)
+	f.screens = []string{
+		"✳ Waiting for 1 background agent to finish\n", // the hook beat the paint
+		"✳ Waiting for 1 background agent to finish\n",
+		"Do you want to proceed?\n❯ 1. Yes\n 2. No",
+	}
+	var prompt string
+	req := baseReq(func(p string) (string, error) {
+		prompt = p
+		return `{"is_error":false,"result":` +
+			mustJSONString(`{"action":"answer","digit":"1","reason":"read-only"}`) + `}`, nil
+	})
+	var slept int
+	req.Wait = func(time.Duration) { slept++ }
+	if err := Judge(f, nil, req); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "❯ 1. Yes") {
+		t.Errorf("the model was handed a screen with no dialog on it:\n%s", prompt)
+	}
+	if slept != 2 {
+		t.Errorf("waited %d times, want one per capture that came up empty", slept)
+	}
+}
+
+// A screen that never grows a dialog is still judged: an escalation over
+// a capture that genuinely showed none is the honest outcome, and the
+// episode's dialog=false line is what tells that apart from a verdict
+// blaming the screen. The wait is bounded, not open-ended.
+func TestJudgeGivesUpWaitingAndJudgesAnyway(t *testing.T) {
+	f := judgeFake(ArbiterModeRecommend)
+	f.screen = "just some scrollback\n"
+	called := false
+	req := baseReq(func(string) (string, error) {
+		called = true
+		return `{"is_error":false,"result":` +
+			mustJSONString(`{"action":"escalate","reason":"cannot see a dialog"}`) + `}`, nil
+	})
+	req.Wait = func(time.Duration) {}
+	if err := Judge(f, nil, req); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Error("a screen with no dialog must still be judged, not dropped")
+	}
+	if f.captures != dialogAttempts {
+		t.Errorf("captured %d times, want the bound of %d", f.captures, dialogAttempts)
+	}
+}
+
+// The human is often faster than a process start, and now they have the
+// whole wait to be faster in. Judging a dialog they already answered
+// spends a model turn to park a note on a row ApplyHook has retired.
+func TestJudgeStopsWaitingWhenTheEpisodeEnds(t *testing.T) {
+	f := judgeFake(ArbiterModeRecommend)
+	f.screen = "just some scrollback\n"
+	f.paneOpts = map[string]string{"%1/" + ClaudeStatusMarker: "busy"}
+	called := false
+	req := baseReq(func(string) (string, error) { called = true; return "", nil })
+	req.Wait = func(time.Duration) {}
+	if err := Judge(f, nil, req); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Error("a dialog answered during the wait must not be judged")
 	}
 }
 

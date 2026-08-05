@@ -4,7 +4,12 @@ import "testing"
 
 // fakeTmux is the shared test double for the Tmux interface.
 type fakeTmux struct {
-	screen         string
+	screen string
+	// screens are served one per CapturePane call, in order, before
+	// falling back to screen — for the tests that need the pane to
+	// repaint between captures.
+	screens        []string
+	captures       int
 	cmd            string
 	panes          []Pane
 	err            error
@@ -26,7 +31,14 @@ type fakeTmux struct {
 	created        [][3]string       // {name, dir, cmd}
 }
 
-func (f *fakeTmux) CapturePane(pane string) (string, error) { return f.screen, f.err }
+func (f *fakeTmux) CapturePane(pane string) (string, error) {
+	i := f.captures
+	f.captures++
+	if i < len(f.screens) {
+		return f.screens[i], f.err
+	}
+	return f.screen, f.err
+}
 func (f *fakeTmux) SendKeys(pane string, keys ...string) error {
 	if f.err != nil {
 		return f.err

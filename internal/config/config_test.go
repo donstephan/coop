@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func write(t *testing.T, content string) string {
@@ -291,5 +292,68 @@ func TestAddRepoLeavesMalformedConfigAlone(t *testing.T) {
 	}
 	if string(data) != `{"repos": [` {
 		t.Fatalf("malformed config was rewritten:\n%s", data)
+	}
+}
+
+func TestToolboxDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"repos":["~/sprocket-v2"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ToolboxEnabled() {
+		t.Error("absent toolbox block should be enabled")
+	}
+	if got := c.ToolboxEngine(); got != "docker" {
+		t.Errorf("engine = %q, want docker", got)
+	}
+	idle, err := c.ToolboxIdle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle != 30*time.Minute {
+		t.Errorf("idle = %v, want 30m", idle)
+	}
+}
+
+func TestToolboxExplicit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{"toolbox":{"enabled":false,"engine":"podman","idle_timeout":"0"}}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ToolboxEnabled() {
+		t.Error("explicit false should disable")
+	}
+	if got := c.ToolboxEngine(); got != "podman" {
+		t.Errorf("engine = %q, want podman", got)
+	}
+	idle, err := c.ToolboxIdle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idle != 0 {
+		t.Errorf("idle = %v, want 0", idle)
+	}
+}
+
+func TestToolboxBadIdle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"toolbox":{"idle_timeout":"soon"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ToolboxIdle(); err == nil {
+		t.Error("want error for unparseable idle_timeout")
 	}
 }
