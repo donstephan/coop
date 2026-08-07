@@ -1,1 +1,8 @@
-{ "mounts": ["~/.local/bin:rw"] }
+{
+  "mounts": ["~/.local/bin:rw"],
+  "commands": {
+    "go": { "allow": ["build", "test", "vet", "mod"] },
+    "gofmt": { "allow": true },
+    "jq": {}
+  }
+}

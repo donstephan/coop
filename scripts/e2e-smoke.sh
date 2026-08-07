@@ -41,7 +41,7 @@ tmux -L "$SOCKET" set -g monitor-bell on
 
 # The hub TUI in its own session on the same socket.
 tmux -L "$SOCKET" new-session -d -s hub -x 100 -y 30 \
-  "/tmp/coop-e2e -socket '$SOCKET' -allowed-cmds sleep,sh,bash -config '$TMPD/config.json' -claude-cmd 'sleep 300' -hooks=false"
+  "/tmp/coop-e2e -socket '$SOCKET' -allowed-cmds sleep,sh,bash -config '$TMPD/config.json' -claude-cmd 'sleep 300' -hooks=false -plugin=false"
 
 wait_for() { # wait_for <pattern> <pane>
   for _ in $(seq 40); do

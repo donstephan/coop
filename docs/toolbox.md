@@ -75,6 +75,32 @@ every `pip install` in an overlay or a session with
 
 ## Adding tools for a repo
 
+### The short way: `/coop:init`
+
+In any session coop started, run:
+
+```
+/coop:init
+```
+
+Claude reads the repo's `go.mod`/`package.json`/`pyproject.toml`, its
+`docker-compose.yml` and its CI config, asks you one question — all-in or
+tools-only (see *Going all-in* below) — and writes `.coop/tools.Dockerfile`
+and `.coop/toolbox.json`. It stops there and hands you the
+`coop tools rebuild .` to run yourself.
+
+It writes nothing in `.claude/`: the permission grants come from the `commands`
+block, and coop injects them itself (see *Permissions* below). They apply from
+your next session, not the one you ran the skill in.
+
+The skill ships inside the coop binary and is injected only into sessions coop
+launches; a `claude` you started yourself won't have it. `COOP_PLUGIN=0` or
+`-plugin=false` turns the injection off.
+
+The rest of this section is what it writes, and what to write by hand.
+
+### By hand
+
 Create `.coop/tools.Dockerfile` in the repo:
 
 ```dockerfile
@@ -84,18 +110,58 @@ RUN pip install --no-cache-dir pymongo redis boto3 tabulate
 RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-client \
     && rm -rf /var/lib/apt/lists/*
+```
 
-# One line per command you want shimmed onto the session's PATH.
+Then declare which commands go on the session's `PATH`, in
+`.coop/toolbox.json`:
+
+```json
+{ "commands": { "python3": {}, "pip3": {}, "jq": {}, "curl": {}, "psql": {} } }
+```
+
+**`commands` is the complete list, not an addition to one.** Declaring it
+replaces the image's own manifest, so list the base tools you rely on too —
+that's the point: one file tells you everything this repo shims. Omit the block
+entirely and you get the image's manifest instead, which is the zero-config
+path and still works.
+
+The older way — appending to `/etc/coop/tools` in the Dockerfile — is still
+supported and is what an image uses to declare itself:
+
+```dockerfile
 RUN printf '%s\n' psql >> /etc/coop/tools
 ```
+
+Prefer `commands` in a repo you're setting up by hand. It's explicit, it's
+where `"allow": true` lives (see *Permissions* below), and editing it doesn't
+rebuild the image.
 
 Two things to know:
 
 - **`FROM coop-tools:base` is always right.** coop keeps that tag pointing at
   the current base image, so you never write a hash.
-- **The manifest is what gets shimmed**, not what's installed. `pip install
-  pymongo` makes it importable from the already-shimmed `python3`; you only
-  append to `/etc/coop/tools` for a new *command*.
+- **Declared is not the same as installed.** `pip install pymongo` makes it
+  importable from an already-declared `python3`; you add a `commands` entry
+  only for a new *command* a session runs by name. Install without declaring
+  when a tool is only needed inside the image.
+
+**coop checks the two agree.** Declaring a command the image can't resolve
+would otherwise give you a shim that exists — and is therefore granted, if you
+marked it `"allow": true` — which then dies at exec on `executable file not
+found`. So coop probes the image and names them:
+
+```
+$ coop tools rebuild .
+warning: declared but not in the image: psql — their shims will fail at exec;
+install them in .coop/tools.Dockerfile or drop them from "commands" in
+.coop/toolbox.json
+rebuilt /home/user/sprocket-v2
+```
+
+It's a warning, not a failure: the shims are still written, because quietly
+skipping one would hand that command to the host, which is the thing declaring
+it was meant to stop. On session create the same line goes to
+`~/.local/state/coop/toolbox/build.log` instead, since nobody is watching.
 - **The build context is `.coop/`, not the repo.** `COPY` can only reach files
   next to the Dockerfile — an image that depended on your working tree would
   rebuild on every edit and mean something different on every checkout.
@@ -128,9 +194,119 @@ finds the shim again, until the process limit. Installing them in the image is
 fine and sometimes useful; putting them on the session's `PATH` is not. coop
 drops those lines when it reads the manifest.
 
+## Permissions: stopping the prompts
+
+A shim doesn't change the command string. Claude types `mongosh --eval ...`,
+the shim intercepts it on `PATH`, and Claude Code's permission layer only ever
+sees `mongosh --eval ...`. So the way to stop being prompted for a
+containerized tool is to allowlist the **bare name** — not a
+`docker compose exec` prefix.
+
+**You don't write that rule anywhere.** Mark the command in the `commands`
+block and coop writes it for you:
+
+```json
+{
+  "commands": {
+    "go": {},
+    "gofmt": {},
+    "psql": {},
+    "python3": { "allow": true }
+  }
+}
+```
+
+- **Being declared is what shims a command.**
+- **`"allow"` is the only route to a no-prompt grant**, and it is
+  default-deny. Everything else declared is shimmed and still prompts.
+
+`"allow": true` grants the whole command. A **list** grants one rule per
+entry and leaves everything else prompting:
+
+```json
+{
+  "commands": {
+    "go":        { "allow": ["build", "test", "vet", "mod"] },
+    "terraform": { "allow": ["plan", "validate"] },
+    "gofmt":     { "allow": true }
+  }
+}
+```
+
+Be clear-eyed about what that buys, because it differs by tool:
+
+- **On a compiler or interpreter it does not restrict anything.** `go test`
+  builds and runs whatever is in the tree, and a test that shells out to
+  `go install` gets there regardless. Same for `python3`, `node`, `make`.
+- **What it does buy is where the prompt lands**, and that is worth having.
+  `go install` succeeds, works for the rest of that command, and writes into a
+  container `$HOME` you will never look in (see *Gotchas*). Granting `build`,
+  `test`, `vet` and `mod` puts your inner loop on rails and makes the four
+  surprising verbs stop and ask.
+- **On a service CLI it is a real line.** `terraform plan` cannot become
+  `terraform apply`, and `gh pr list` cannot become `gh pr merge`. Granting the
+  read side while the write side prompts means what it looks like it means.
+
+An entry is an argument prefix, matched ahead of the rest of the command line,
+so `"build"` covers `go build -o ~/.local/bin/coop ./cmd/coop`. Entries are
+plain words, paths and dashes; anything carrying quotes, `*` or shell
+metacharacters is dropped, and dropping one costs you a prompt rather than the
+file.
+
+At session create, coop writes `Bash(python3 *)` into a settings file under its
+own state directory — beside that repo's shims — and launches the session with
+`--settings` pointing at it. Nothing lands in your repo.
+
+**That's the whole reason there's no permission file to commit.** Putting the
+rule in `.claude/settings.json` is the trap: that file is committed, so it also
+reaches a `claude` somebody starts outside coop — where there is no shim, and
+`Bash(python3 *)` now means "run the host's python3, unattended, no prompt."
+The grant was made on the assumption "bare name = container", and committing it
+carries it somewhere that assumption doesn't hold. An injected file reaches
+exactly the sessions coop launched, which are exactly the sessions with the
+shims.
+
+Coop goes one step further and derives the rules from the shims that **exist**,
+not from what the repo declared. A first session on a fresh clone launches
+while the image is still building, so it gets no grants; the next one gets them
+all. A grant can never arrive before the tool it grants.
+
+**Both take effect on the next session.** Shims and grants are resolved when a
+session is created, so after editing `.coop/toolbox.json` — or running
+`/coop:init` — the session you're in keeps prompting until you start a new one.
+`coop tools rebuild .` refreshes the shims immediately, but not the grants of a
+session that has already launched.
+
+To see what a new session would get, without starting one:
+
+```
+$ coop tools grants
+Bash(go build *)
+Bash(go test *)
+Bash(gofmt *)
+note: grants apply to sessions started from now on, not to running ones
+```
+
+The rules go to stdout and everything explaining them to stderr, so
+`coop tools grants | wc -l` works. If a command you marked `"allow"` is missing
+from the list, that's the point of the command: it says so, and why —
+usually that its shim isn't written yet, so the grant is withheld until
+`coop tools rebuild .` has run.
+
+Two things this is not. It doesn't inspect anything at call time — a grant is
+exactly as narrow as the rule, and nothing re-reads the command as it runs. And
+it is not a boundary: the repo is mounted read-write and the container runs as
+you. It keeps an allow rule from meaning something you didn't intend; it
+doesn't contain anything.
+
+A repo that already has its own `Bash(...)` rules committed keeps them.
+`/coop:init` won't touch `.claude/` at all — if you have rules there from
+before the toolbox, they're yours to keep or remove, and they carry the caveat
+above.
+
 ## Networks and host paths: `.coop/toolbox.json`
 
-Two things a Dockerfile can't state:
+Besides `commands` above, two things a Dockerfile can't state:
 
 ```json
 {
@@ -212,6 +388,8 @@ Three things stay on the host no matter what:
 | `coop tools stop [repo]` | Kill it (the next command restarts it) |
 | `coop tools rebuild [repo]` | Rebuild the image, build output on your terminal |
 | `coop tools prune` | Remove stopped containers and superseded images |
+| `coop tools home [repo]` | Print the container's `$HOME` for that repo |
+| `coop tools grants [repo]` | Print the permission rules a new session would get |
 
 `[repo]` defaults to the working directory. `coop tools exec` also exists, but
 it's what the shims call — you shouldn't need it.
@@ -249,12 +427,44 @@ directory. So `go install`, `pip install --user`, `npm i -g` and `cargo install`
 all succeed, work for the rest of that command, and are then invisible from the
 host — forever. Only installs targeting a declared mount reach you.
 
+The path itself is honest: that directory is bind-mounted at its own host path,
+so what a tool prints inside is openable outside, verbatim. It just isn't the
+home you expected. Two ways to find it:
+
+```
+coop tools home          # prints the path, so `ls "$(coop tools home)"` works
+```
+
+and a `README.coop-toolbox` sitting in the directory, which says which repo
+owns it and how to make an install reach the host — deliberately not a dotfile,
+since the point is to be seen by the `ls` that brought you there.
+
+**The session is told this up front.** A shim is invisible by design — claude
+types `go build` and that is exactly what runs — which is right until something
+fails, when docker's `executable file not found` reads as a coop bug. So in
+sessions coop launches, coop injects a short note listing the containerized
+commands and naming the container `$HOME`. It arrives on every `SessionStart`,
+including after a compaction, so it is still there in a long session. Nothing is
+written to your repo to make this happen, and nothing reaches a `claude` you
+started outside coop — where there are no shims, and the note would be false.
+If the note is missing, the shims aren't written yet (or the build failed):
+check `~/.local/state/coop/toolbox/build.log`.
+
 **Your shell's environment doesn't come with you.** The container gets `TERM`,
 `LANG`, `LC_ALL`, `LC_CTYPE` and `TZ` and nothing else — no `API_TOKEN` you
 exported, no `AWS_PROFILE`. That's deliberate: a variable a tool needs should be
 named in the overlay (`ENV`) or read from a mounted config directory, so it
 travels with the repo instead of depending on which shell coop happened to be
 started from.
+
+**Install the new coop before adopting new `toolbox.json` syntax.** The shims
+call whatever `coop` is on your `PATH`, and a repo config that binary can't
+parse fails loud — so adopting a field or form your installed coop predates
+stops *every shimmed command in that repo* with a parse error until you
+rebuild. An `"allow": ["build", "test"]` list read by a coop that only knew
+`"allow": true` takes out `go` itself, which is also what you need to rebuild
+with; recover with the host's copy by absolute path, or by reverting the file.
+Order is: `coop tools rebuild .` and a fresh binary first, edit second.
 
 **The base image ships no compilers.** Committing a repo's toolchain to the
 container is a decision you make in the overlay, not a default you get handed.

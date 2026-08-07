@@ -168,24 +168,94 @@ func LookHost(tool string) (string, error) {
 	return "", fmt.Errorf("%s: not found outside coop's shim directories", tool)
 }
 
+// repoTools decides which commands this repo shims, from the two places
+// that can say so.
+//
+// A "commands" block in .coop/toolbox.json is the **complete** list for
+// that repo: it does not extend the image's manifest, it replaces it, so
+// a declared repo is one file you can read to know everything that is
+// shimmed. A repo that declares commands and omits python3 does not get
+// python3 from the base image — that is the cost of explicit, and it is
+// deliberate rather than an oversight.
+//
+// With no block at all the image's own manifest is the whole story, which
+// is the zero-config path: a repo with no .coop/ still gets the base
+// image's tools, exactly as before this field existed.
+func repoTools(e Engine, repo, image string) ([]string, error) {
+	cfg, err := LoadRepoConfig(repo)
+	if err != nil {
+		return nil, err
+	}
+	if names, declared := cfg.CommandNames(); declared {
+		return names, nil
+	}
+	return ReadManifest(e, image)
+}
+
+// MissingTools reports which of tools the image cannot resolve.
+//
+// This is the check that replaces co-location. While the manifest lived
+// in the Dockerfile it sat directly under the RUN that installed the
+// binary, so declaring without installing took effort; a "commands" block
+// in toolbox.json is a second file, and the two can now disagree
+// silently. The symptom is bad — the shim exists, so the guard lets the
+// command through, and it fails at exec with docker's bare "executable
+// file not found" naming a tool the repo thought it had declared.
+//
+// One container run for the whole list, not one per tool. The names have
+// already been through safeTool, so they cannot carry a metacharacter
+// into this script.
+//
+// A check that cannot run reports nothing rather than failing: this is a
+// diagnostic, and an engine hiccup here must not stop a session being
+// created.
+func MissingTools(e Engine, image string, tools []string) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	script := "for t in " + strings.Join(tools, " ") +
+		`; do command -v "$t" >/dev/null 2>&1 || echo "$t"; done`
+	out, err := e.Output("run", "--rm", "--entrypoint", "sh", image, "-c", script)
+	if err != nil {
+		return nil
+	}
+	var missing []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			missing = append(missing, line)
+		}
+	}
+	return missing
+}
+
 // Prepare resolves the repo's image and writes its shims. This runs at
 // session create, not at container start: shims cannot be generated from
 // a running container, because nothing starts the container until a shim
 // is called.
-func Prepare(e Engine, repo, exe string) error {
+//
+// The returned names are declared commands the image cannot resolve.
+// They are a warning, not an error: the shims are written anyway, because
+// the alternative — silently skipping one — turns a typo into "that tool
+// quietly uses the host copy", which is the failure the whole declaration
+// exists to prevent. Failing loud at exec is the toolbox's existing stance
+// for anything about the container.
+func Prepare(e Engine, repo, exe string) ([]string, error) {
 	image, err := EnsureImage(e, repo)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tools, err := ReadManifest(e, image)
+	tools, err := repoTools(e, repo, image)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dir := ShimDir(repo)
 	if dir == "" {
-		return nil // no resolvable home: fail open, host tools stay in play
+		return nil, nil // no resolvable home: fail open, host tools stay in play
 	}
-	return WriteShims(dir, exe, repo, tools)
+	if err := WriteShims(dir, exe, repo, tools); err != nil {
+		return nil, err
+	}
+	return MissingTools(e, image, tools), nil
 }
 
 // shellQuote wraps s in single quotes, escaping any it contains.

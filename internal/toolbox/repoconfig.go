@@ -7,15 +7,145 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
-// RepoConfig is <repo>/.coop/toolbox.json: the two things a Dockerfile
-// cannot state — the network the container joins and the host paths it
-// can see.
+// RepoConfig is <repo>/.coop/toolbox.json: the things a Dockerfile
+// cannot state — the network the container joins, the host paths it can
+// see, and the repo's explicit command declaration.
 type RepoConfig struct {
-	Network string   `json:"network"`
-	Mounts  []string `json:"mounts"`
+	Network  string                 `json:"network"`
+	Mounts   []string               `json:"mounts"`
+	Commands map[string]CommandSpec `json:"commands"`
+}
+
+// CommandSpec is what a repo says about one declared command. Being
+// declared at all is what shims it; Allow is the only switch, and it is
+// the only route to a Bash(...) grant in the settings coop injects.
+type CommandSpec struct {
+	Allow AllowSpec `json:"allow"`
+}
+
+// AllowSpec is `"allow": true` or `"allow": ["build", "test"]`.
+//
+// The list form grants one rule per entry — Bash(go build *) rather than
+// Bash(go *) — and everything it does not name keeps prompting. What that
+// buys is **where the prompt lands**, not containment: `go test` compiles
+// and runs whatever is in the tree, and a test that shells out to
+// `go install` gets there regardless, so narrowing a compiler restricts
+// nothing. It is worth doing anyway because the commands worth prompting
+// on are rarely the dangerous ones — they are the surprising ones.
+// `go install` succeeds, works for the rest of that command, and writes
+// into a container $HOME invisible from the host; a prompt is exactly the
+// moment a human says "that is not going where you think".
+//
+// So: grant the inner loop, let the unusual verbs ask. On a service CLI
+// (terraform plan vs apply, gh pr list vs merge) the same shape does draw
+// a real line, because neither subcommand can reach the other.
+type AllowSpec struct {
+	All  bool     // "allow": true — the whole command
+	Args []string // "allow": ["build", "test"] — one rule per entry
+}
+
+func (a *AllowSpec) UnmarshalJSON(b []byte) error {
+	var all bool
+	if err := json.Unmarshal(b, &all); err == nil {
+		a.All = all
+		return nil
+	}
+	var args []string
+	if err := json.Unmarshal(b, &args); err != nil {
+		return fmt.Errorf("allow must be true/false or a list of argument prefixes: %w", err)
+	}
+	a.Args = args
+	return nil
+}
+
+// Rules renders the Bash(...) rule bodies this spec grants for tool —
+// "go" for the whole command, "go build" and "go test" for a list. The
+// caller wraps each in Bash(<body> *); a two-token prefix matches an
+// invocation with arguments the same way a one-token prefix does.
+//
+// Unsafe argument prefixes are dropped rather than failing the file, the
+// same way ParseManifest drops a bad manifest line: one missing grant
+// costs a prompt, where refusing the whole config would cost every grant
+// the repo has.
+func (s CommandSpec) Rules(tool string) []string {
+	if s.Allow.All {
+		return []string{tool}
+	}
+	out := make([]string, 0, len(s.Allow.Args))
+	for _, arg := range s.Allow.Args {
+		if safeArg(arg) {
+			out = append(out, tool+" "+arg)
+		}
+	}
+	return out
+}
+
+// safeArg accepts an argument prefix that can be embedded in a
+// Bash(<tool> <arg> *) rule without changing its shape. Tokens of
+// [A-Za-z0-9._/-] separated by single spaces: enough for "plan",
+// "pr list" and "build ./cmd/coop", and short of anything — a ")" ending
+// the rule early, a "*" widening it, a quote or shell metacharacter —
+// that would make the written rule mean more than the file says.
+func safeArg(s string) bool {
+	if s == "" || len(s) > 100 {
+		return false
+	}
+	for _, field := range strings.Split(s, " ") {
+		if field == "" { // leading, trailing or doubled space
+			return false
+		}
+		for _, r := range field {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			case r == '.', r == '_', r == '-', r == '/':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Commands returns the declared command names in sorted order, dropping
+// the same unsafe and reserved names ParseManifest drops. Sorted because
+// map order is random and shim generation must not churn.
+//
+// The second result reports whether the repo declared a commands block at
+// all — an empty block is a repo saying "shim nothing", which is not the
+// same as saying nothing.
+func (c RepoConfig) CommandNames() ([]string, bool) {
+	if c.Commands == nil {
+		return nil, false
+	}
+	out := make([]string, 0, len(c.Commands))
+	for name := range c.Commands {
+		if !safeTool(name) || reservedTools[name] {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, true
+}
+
+// Allowed returns the Bash(...) rule bodies the repo grants, sorted by
+// command — "go" for a whole-command grant, "go build" and "go test" for
+// a narrowed one. Everything else declared is shimmed and still prompts.
+//
+// Rule bodies rather than command names because a command can now yield
+// more than one rule. Callers that need to know which command a rule came
+// from (Grants, checking the shim exists) walk CommandNames instead.
+func (c RepoConfig) Allowed() []string {
+	names, _ := c.CommandNames()
+	out := names[:0:0]
+	for _, n := range names {
+		out = append(out, c.Commands[n].Rules(n)...)
+	}
+	return out
 }
 
 // Mount is one resolved host path the container sees. There is no

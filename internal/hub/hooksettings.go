@@ -28,11 +28,35 @@ func DefaultHookSettingsPath() string {
 }
 
 // WriteHookSettings writes the settings file injected into launched
-// sessions, registering coop hook for every event. It overwrites
-// unconditionally: the file is coop infrastructure, regenerated each
-// hub launch so it always names the running binary — deliberately
-// unlike ArbiterHome's seed-once, user-owned arbiter.md.
+// sessions, registering coop hook for every event and nothing else. It is
+// the fallback shape, used for a session whose repo has no toolbox to
+// derive grants from.
 func WriteHookSettings(path, exe string) error {
+	return WriteSessionSettings(path, exe, nil)
+}
+
+// WriteSessionSettings writes the settings file injected into launched
+// sessions: coop hook on every event, plus a Bash(<tool> *) rule for each
+// name in allow. It overwrites unconditionally, because the file is coop
+// infrastructure regenerated from the running binary — deliberately
+// unlike ArbiterHome's seed-once, user-owned arbiter.md.
+//
+// The grants live here, in a file coop owns and injects, rather than in
+// the repo's committed .claude/settings.json. That is the whole reason
+// there is no PreToolUse guard to install: a committed grant also reaches
+// a claude started outside coop, where no shim is on PATH and the rule
+// means "run the host's copy unattended", so it needs something to
+// re-check that assumption at call time. An injected grant reaches only
+// the sessions coop launched, and the caller derives allow from the shims
+// that exist (toolbox.Grants), so the grant and the tool it grants are
+// written by the same act and cannot desynchronize.
+//
+// Verified rather than assumed, the way "a PreToolUse hook outranks an
+// allow rule" was: a Bash(...) rule delivered by --settings turns a
+// blocked Bash call into an executed one, the Bash(<tool> *) wildcard
+// form matches, and hooks and permissions coexist in one file with the
+// hooks still firing.
+func WriteSessionSettings(path, exe string, allow []string) error {
 	type hookCmd struct {
 		Type    string `json:"type"`
 		Command string `json:"command"`
@@ -47,7 +71,17 @@ func WriteHookSettings(path, exe string) error {
 			{Type: "command", Command: shellQuote(exe) + " hook", Timeout: 5},
 		}}}
 	}
-	raw, err := json.MarshalIndent(map[string]any{"hooks": hooks}, "", "  ")
+	doc := map[string]any{"hooks": hooks}
+	// Omitted entirely rather than written empty: a session on a repo with
+	// no grants must look exactly like a session from before this existed.
+	if len(allow) > 0 {
+		rules := make([]string, 0, len(allow))
+		for _, body := range allow {
+			rules = append(rules, BashRule(body))
+		}
+		doc["permissions"] = map[string]any{"allow": rules}
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -55,6 +89,14 @@ func WriteHookSettings(path, exe string) error {
 		return err
 	}
 	return os.WriteFile(path, append(raw, '\n'), 0o644)
+}
+
+// BashRule renders a rule body ("go", "go build") as the permission rule
+// written into the injected settings. One definition, because `coop tools
+// grants` prints what this writes — a second copy of the format string
+// would let the two drift and make the debug aid quietly wrong.
+func BashRule(body string) string {
+	return "Bash(" + body + " *)"
 }
 
 // WithHookSettings appends the --settings flag to claudeCmd, which may

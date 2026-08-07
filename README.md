@@ -193,11 +193,13 @@ per repo. The repo is mounted at its own host path, so a traceback, a
 config file's absolute path and anything claude then opens with `Read`
 all name the same file; the container starts on the first command that
 uses it and exits itself when it has been idle. With no config at all a
-session gets `python3`, `pip3`, `jq`, `gh`, `curl` and `make` from the
-base image; with no docker installed nothing changes at all. It is a
+session gets `python3`, `pip3`, `jq` and `curl` from the base image
+(`git`, `gh` and `make` ship in it but are deliberately not shimmed);
+with no docker installed nothing changes at all. It is a
 reproducible toolchain and a clean host, **not** a sandbox — the repo is
-mounted read-write and the container runs as you. See
-[docs/toolbox.md](docs/toolbox.md).
+mounted read-write and the container runs as you. Running `/coop:init` in a
+session sets a repo up: it reads the toolchain, asks all-in or tools-only, and
+writes the overlay. See [docs/toolbox.md](docs/toolbox.md).
 
 ## Config
 
@@ -207,6 +209,7 @@ mounted read-write and the container runs as you. See
 | `-config` | `COOP_CONFIG` | `~/.config/coop/config.json` | the file below: repo list, tmux overrides, `arbiter.model` |
 | `-claude-cmd` | `COOP_CLAUDE_CMD` | `claude` | the command a new session runs |
 | `-hooks` | `COOP_HOOKS` | on | publish status through `coop hook` (see [How it works](#how-it-works)). `0` or `false` opts out, which drops those sessions to title-only status |
+| `-plugin` | `COOP_PLUGIN` | on | inject the `/coop:init` skill into new sessions. `0` or `false` opts out |
 | `-allowed-cmds` | `COOP_ALLOWED_CMDS` | `claude,node` | commands quick-send may target (`""` = never send) |
 | `-done-ttl` | `COOP_DONE_TTL` | `5m` | how long a finished session shows `done` before decaying to idle (`0` disables) |
 | `arbiter.model` (config.json) | — | `sonnet` | model each triage episode runs (`claude -p --model <model>`) |

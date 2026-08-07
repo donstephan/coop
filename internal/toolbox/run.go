@@ -188,6 +188,9 @@ func Start(e Engine, repo, image string, cfg RepoConfig, idle time.Duration) err
 		if err := os.MkdirAll(home, 0o755); err != nil {
 			return err
 		}
+		// Best-effort: the marker is documentation, and failing to write
+		// it must not stop a container coming up.
+		_ = WriteHomeMarker(repo)
 	}
 	args, err := RunArgs(repo, image, cfg, idle)
 	if err != nil {

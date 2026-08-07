@@ -148,12 +148,147 @@ func TestPrepareWritesShims(t *testing.T) {
 	e := newFakeEngine()
 	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
 	e.outputs["run --rm --entrypoint cat "+BaseTag()+" /etc/coop/tools"] = "jq\n"
-	if err := Prepare(e, repo, "/home/user/bin/coop"); err != nil {
+	if _, err := Prepare(e, repo, "/home/user/bin/coop"); err != nil {
 		t.Fatal(err)
 	}
 	shim := filepath.Join(home, ".local", "state", "coop", "toolbox",
 		Slug(repo), "bin", "jq")
 	if _, err := os.Stat(shim); err != nil {
 		t.Fatalf("shim not written: %v", err)
+	}
+}
+
+// writeRepoConfig writes <repo>/.coop/toolbox.json.
+func writeRepoConfig(t *testing.T, repo, body string) {
+	t.Helper()
+	dir := filepath.Join(repo, ".coop")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "toolbox.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A declared commands block is the complete list: it replaces the image's
+// manifest rather than extending it, so a repo that declares commands and
+// omits a base tool does not get that base tool. That is the cost of
+// explicit, and it must not quietly stop being true.
+func TestPrepareCommandsBlockReplacesManifest(t *testing.T) {
+	home := fakeHome(t)
+	repo := t.TempDir()
+	writeRepoConfig(t, repo, `{"commands":{"go":{},"psql":{"allow":true}}}`)
+	e := newFakeEngine()
+	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
+	// The image still offers jq. The repo did not declare it, so it must
+	// not be shimmed — and the manifest must not even be read.
+	e.outputs["run --rm --entrypoint cat "+BaseTag()+" /etc/coop/tools"] = "jq\n"
+	if _, err := Prepare(e, repo, "/home/user/bin/coop"); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, ".local", "state", "coop", "toolbox", Slug(repo), "bin")
+	for _, tool := range []string{"go", "psql"} {
+		if _, err := os.Stat(filepath.Join(bin, tool)); err != nil {
+			t.Errorf("declared %s not shimmed: %v", tool, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(bin, "jq")); !os.IsNotExist(err) {
+		t.Error("undeclared jq was shimmed from the image manifest")
+	}
+}
+
+// With no commands block the image manifest is the whole story — the
+// zero-config path, which must keep working untouched.
+func TestPrepareFallsBackToManifest(t *testing.T) {
+	home := fakeHome(t)
+	repo := t.TempDir()
+	writeRepoConfig(t, repo, `{"network":"n"}`)
+	e := newFakeEngine()
+	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
+	e.outputs["run --rm --entrypoint cat "+BaseTag()+" /etc/coop/tools"] = "jq\npython3\n"
+	if _, err := Prepare(e, repo, "/home/user/bin/coop"); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, ".local", "state", "coop", "toolbox", Slug(repo), "bin")
+	for _, tool := range []string{"jq", "python3"} {
+		if _, err := os.Stat(filepath.Join(bin, tool)); err != nil {
+			t.Errorf("%s not shimmed from the image manifest: %v", tool, err)
+		}
+	}
+}
+
+// An empty block is a repo saying "shim nothing", which is not the same
+// as saying nothing — it must not fall through to the image.
+func TestPrepareEmptyCommandsBlockShimsNothing(t *testing.T) {
+	home := fakeHome(t)
+	repo := t.TempDir()
+	writeRepoConfig(t, repo, `{"commands":{}}`)
+	e := newFakeEngine()
+	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
+	e.outputs["run --rm --entrypoint cat "+BaseTag()+" /etc/coop/tools"] = "jq\n"
+	if _, err := Prepare(e, repo, "/home/user/bin/coop"); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, ".local", "state", "coop", "toolbox", Slug(repo), "bin")
+	if _, err := os.Stat(filepath.Join(bin, "jq")); !os.IsNotExist(err) {
+		t.Error("an empty commands block fell through to the image manifest")
+	}
+}
+
+// resolveKey is the fake-engine key for the resolution probe.
+func resolveKey(image string, tools ...string) string {
+	return "run --rm --entrypoint sh " + image + " -c " +
+		"for t in " + strings.Join(tools, " ") +
+		`; do command -v "$t" >/dev/null 2>&1 || echo "$t"; done`
+}
+
+// The check that replaces co-location: a repo can now declare a command
+// in toolbox.json and forget to install it in the Dockerfile, and the
+// symptom is a shim that fails at exec rather than anything visible here.
+func TestPrepareReportsMissingTools(t *testing.T) {
+	home := fakeHome(t)
+	repo := t.TempDir()
+	writeRepoConfig(t, repo, `{"commands":{"go":{},"psql":{}}}`)
+	e := newFakeEngine()
+	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
+	e.outputs[resolveKey(BaseTag(), "go", "psql")] = "psql\n"
+	missing, err := Prepare(e, repo, "/home/user/bin/coop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(missing, ",") != "psql" {
+		t.Errorf("missing = %v, want [psql]", missing)
+	}
+	// The shim is still written: skipping it would silently hand psql to
+	// the host, which is the failure the declaration exists to prevent.
+	bin := filepath.Join(home, ".local", "state", "coop", "toolbox", Slug(repo), "bin")
+	if _, err := os.Stat(filepath.Join(bin, "psql")); err != nil {
+		t.Errorf("missing tool lost its shim: %v", err)
+	}
+}
+
+func TestPrepareReportsNothingWhenAllResolve(t *testing.T) {
+	repo := t.TempDir()
+	writeRepoConfig(t, repo, `{"commands":{"go":{}}}`)
+	e := newFakeEngine()
+	e.outputs["image inspect "+BaseTag()] = "sha256:abc"
+	e.outputs[resolveKey(BaseTag(), "go")] = "\n"
+	missing, err := Prepare(e, repo, "/home/user/bin/coop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Errorf("missing = %v, want none", missing)
+	}
+}
+
+// A diagnostic that cannot run must not stop a session being created.
+func TestMissingToolsSwallowsEngineFailure(t *testing.T) {
+	e := newFakeEngine() // no output registered: the probe errors
+	if got := MissingTools(e, "img", []string{"go"}); got != nil {
+		t.Errorf("a failed probe must report nothing, got %v", got)
+	}
+	if got := MissingTools(e, "img", nil); got != nil {
+		t.Errorf("an empty list must not run the probe, got %v", got)
 	}
 }

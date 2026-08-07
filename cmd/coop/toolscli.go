@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"coop/internal/config"
+	"coop/internal/hub"
 	"coop/internal/toolbox"
 )
 
@@ -25,7 +26,7 @@ func isToolsCmd(args []string) bool {
 }
 
 func toolsUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: coop tools <exec|ls|up|stop|prune|rebuild|shell> [args]")
+	fmt.Fprintln(w, "usage: coop tools <exec|ls|up|stop|prune|rebuild|shell|home|grants> [args]")
 }
 
 func runToolsCLI(args []string, stdout, stderr io.Writer) int {
@@ -40,7 +41,19 @@ func runToolsCLI(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "usage: coop tools exec <repo> <tool> [args]")
 			return 2
 		}
-		return toolsExec(rest[0], rest[1], rest[2:])
+		// Resolved like every other subcommand's repo. The shims always
+		// pass an absolute path, where filepath.Abs is Clean and so cannot
+		// change the slug of a container already running. It is a human
+		// typing "coop tools exec . id" this protects: a relative path
+		// slugs to repo-<hash of ".">, which builds a second image under a
+		// name that belongs to no repo and then hands docker "-v .:.:rw",
+		// which it rejects.
+		repo, err := toolsRepo(rest[:1])
+		if err != nil {
+			fmt.Fprintln(stderr, "coop tools:", err)
+			return 1
+		}
+		return toolsExec(repo, rest[1], rest[2:])
 	case "up", "stop", "rebuild", "shell":
 		repo, err := toolsRepo(rest)
 		if err != nil {
@@ -48,6 +61,20 @@ func runToolsCLI(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return toolsManage(sub, repo, stdout, stderr)
+	case "home":
+		repo, err := toolsRepo(rest)
+		if err != nil {
+			fmt.Fprintln(stderr, "coop tools:", err)
+			return 1
+		}
+		return toolsHome(repo, stdout, stderr)
+	case "grants":
+		repo, err := toolsRepo(rest)
+		if err != nil {
+			fmt.Fprintln(stderr, "coop tools:", err)
+			return 1
+		}
+		return toolsGrants(repo, stdout, stderr)
 	case "ls":
 		return toolsList(stdout, stderr)
 	case "prune":
@@ -338,12 +365,40 @@ func newToolboxCmd(cfgPath string) (func(dir, cmd string) string, error) {
 		go func() {
 			// Best-effort: a failed prepare leaves the shim directory
 			// empty and the session on host tools.
-			if perr := toolbox.Prepare(e, dir, exe); perr != nil {
+			missing, perr := toolbox.Prepare(e, dir, exe)
+			if perr != nil {
 				appendBuildLog(dir, perr)
+			} else if len(missing) > 0 {
+				appendBuildLog(dir, missingToolsWarning(missing))
 			}
 		}()
 		return toolbox.WithToolbox(cmd, toolbox.ShimDir(dir))
 	}, nil
+}
+
+// sessionSettingsPath writes the per-repo settings file a session on repo
+// is launched with — coop's hooks plus that repo's grants — and returns
+// its path, or "" for the caller to fall back to the global hook settings.
+//
+// Synchronous on the session-create path on purpose, unlike Prepare's
+// image build: this reads one small JSON file, stats a handful of shims
+// and writes one more, so it costs nothing measurable, and the flag it
+// resolves has to be in the command before the session is launched.
+//
+// The grants it writes are toolbox.Grants — declared *and* already
+// shimmed. On a fresh clone that is empty, because Prepare has not
+// finished building; the next session on that repo gets the full set. A
+// grant arriving a session later than the declaration is the right way
+// round, since the alternative is a grant with no shim behind it.
+func sessionSettingsPath(repo, exe string) string {
+	p := toolbox.SettingsPath(repo)
+	if p == "" {
+		return ""
+	}
+	if err := hub.WriteSessionSettings(p, exe, toolbox.Grants(repo)); err != nil {
+		return "" // fail open: the caller falls back to the global file
+	}
+	return p
 }
 
 // appendBuildLog records a failed prepare. The TUI has no room for a
@@ -366,6 +421,84 @@ func appendBuildLog(repo string, cause error) {
 	fmt.Fprintf(f, "%s %s: %v\n", time.Now().Format(time.RFC3339), repo, cause)
 }
 
+// toolsHome prints the repo's container HOME and nothing else, so it
+// composes: `ls "$(coop tools home)"`.
+//
+// It answers for any repo, running or not — unlike `coop tools ls`, which
+// only sees live containers. That is deliberate: "where did my go install
+// go" is most often asked after an idle-out, when there is no container
+// left to ask about.
+//
+// A path that does not exist yet is still the right answer (it is where
+// the home will be), so this neither creates the directory nor fails on
+// its absence. The note goes to stderr, leaving stdout pure for the
+// command substitution above.
+func toolsHome(repo string, stdout, stderr io.Writer) int {
+	home := toolbox.HomeDir(repo)
+	if home == "" {
+		fmt.Fprintln(stderr, "coop tools: no resolvable home directory")
+		return 1
+	}
+	fmt.Fprintln(stdout, home)
+	if _, err := os.Stat(home); err != nil {
+		fmt.Fprintln(stderr, "note: not created yet — the first shimmed command makes it")
+	}
+	return 0
+}
+
+// toolsGrants prints the permission rules a new session on repo would be
+// launched with — the answer to "why is this still prompting", which was
+// otherwise only readable by starting a session and finding the injected
+// settings file under coop's state directory.
+//
+// stdout is the rules and nothing else, so it composes; everything that
+// explains an empty list goes to stderr, the same split as coop tools
+// home. It answers for a repo whether or not a session is running,
+// because the question is usually asked when none is.
+func toolsGrants(repo string, stdout, stderr io.Writer) int {
+	cfg, err := toolbox.LoadRepoConfig(repo)
+	if err != nil {
+		fmt.Fprintln(stderr, "coop tools:", err)
+		return 1
+	}
+	granted := toolbox.Grants(repo)
+	for _, body := range granted {
+		fmt.Fprintln(stdout, hub.BashRule(body))
+	}
+
+	// Declared "allow" that Grants filtered out: the shim is not there
+	// yet, so the rule is deliberately withheld. This is the single most
+	// useful thing this command says — it is the difference between "I
+	// never granted that" and "the build has not finished".
+	have := make(map[string]bool, len(granted))
+	for _, body := range granted {
+		have[body] = true
+	}
+	var withheld []string
+	for _, body := range cfg.Allowed() {
+		if !have[body] {
+			withheld = append(withheld, body)
+		}
+	}
+	if len(withheld) > 0 {
+		fmt.Fprintf(stderr, "note: declared but not yet shimmed, so not granted: %s\n"+
+			"      run: coop tools rebuild %s\n", strings.Join(withheld, ", "), repo)
+	}
+	if len(granted) == 0 && len(withheld) == 0 {
+		fmt.Fprintln(stderr, "note: no command in .coop/toolbox.json carries \"allow\"")
+	}
+	// Checked last: the rules above are still what the repo declares, but
+	// with the toolbox off nothing injects them, so saying so matters more
+	// than the list.
+	if _, _, serr := toolsSettings(); serr != nil {
+		fmt.Fprintln(stderr, "note: no grants are injected —", serr)
+	}
+	// A session reads --settings at launch, so an edit since then is not
+	// in effect. That is the other half of "why is this still prompting".
+	fmt.Fprintln(stderr, "note: grants apply to sessions started from now on, not to running ones")
+	return 0
+}
+
 // toolsRebuild rebuilds the repo's image with build output on the
 // terminal — the one place a human is watching, and the reason the
 // asynchronous path logs to a file instead.
@@ -374,11 +507,26 @@ func toolsRebuild(e toolbox.Engine, repo string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := toolbox.Prepare(e, repo, exe); err != nil {
+	missing, err := toolbox.Prepare(e, repo, exe)
+	if err != nil {
 		return err
+	}
+	// The one place a human is watching, so the warning goes to them
+	// rather than to build.log.
+	if len(missing) > 0 {
+		fmt.Fprintln(stdout, "warning:", missingToolsWarning(missing))
 	}
 	fmt.Fprintln(stdout, "rebuilt", repo)
 	return nil
+}
+
+// missingToolsWarning phrases a declared-but-absent command as the two
+// edits that fix it, since the name alone reads like a coop bug rather
+// than a disagreement between two files the repo owns.
+func missingToolsWarning(missing []string) error {
+	return fmt.Errorf("declared but not in the image: %s — their shims will fail at exec; "+
+		"install them in .coop/tools.Dockerfile or drop them from \"commands\" in .coop/toolbox.json",
+		strings.Join(missing, ", "))
 }
 
 func toolsList(stdout, stderr io.Writer) int {

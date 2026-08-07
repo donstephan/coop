@@ -7,6 +7,25 @@
 # toolbox never mounts one.
 set -euo pipefail
 
+# This script tests the toolbox, so it must build with the *host's*
+# toolchain. Run from inside a coop session the shim directory is first on
+# PATH, so `go` would run in this repo's own container — which cannot see
+# $work below (it is under $HOME, and only the repo, /tmp, the toolbox
+# home and declared mounts are visible in there). That surfaced as a
+# baffling "go build: mkdir <work>: permission denied". Stripping the shim
+# directory is the same thing LookHost does in Go, for the same reason.
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '/state/coop/toolbox/' | paste -sd: -)
+export PATH
+
+command -v go >/dev/null 2>&1 || {
+	# Not a SKIP: an absent host Go means this check cannot run at all,
+	# and after the PATH strip above the bare "go: command not found"
+	# from the build below would point at the wrong thing entirely.
+	echo "FAIL: no host Go. This test builds coop with the host toolchain" >&2
+	echo "      on purpose — a shimmed go would build into a container" >&2
+	echo "      that cannot see this test's work directory." >&2
+	exit 1
+}
 command -v docker >/dev/null 2>&1 || {
 	echo "SKIP: docker not installed"
 	exit 0
@@ -177,6 +196,92 @@ for tool in tmux docker coop podman gh make; do
 	fi
 done
 echo "ok: manifest shimmed, reserved names dropped"
+
+echo "== an explicit commands block replaces the image manifest"
+# The image above still declares python3/jq/curl (from the base) plus
+# sprocket. Declaring "commands" must make this file the whole story, not
+# an addition to that — the property the unit tests assert against a fake
+# engine and this asserts against a real image.
+cat >"$repo/.coop/toolbox.json" <<EOF
+{
+  "mounts": ["$work/outbin:rw"],
+  "commands": {
+    "sprocket": {},
+    "jq": { "allow": true },
+    "tmux": {},
+    "definitely-absent": {}
+  }
+}
+EOF
+rebuild_out=$("$coop" tools rebuild "$repo" 2>&1)
+for tool in sprocket jq; do
+	if [ ! -x "$shimdir/$tool" ]; then
+		echo "FAIL: declared $tool not shimmed"
+		echo "$rebuild_out"
+		ls -l "$shimdir" || true
+		exit 1
+	fi
+done
+# In the image's own manifest but not declared here, so they must lose
+# their shims: a repo that declares commands and omits python3 does not
+# get python3 from the base image.
+for tool in python3 curl; do
+	if [ -e "$shimdir/$tool" ]; then
+		echo "FAIL: undeclared $tool kept its shim — commands must replace the manifest"
+		ls -l "$shimdir" || true
+		exit 1
+	fi
+done
+# Reserved names are dropped whichever source names them; JSON is no safer
+# than a manifest line for a name that reroutes coop's own plumbing.
+if [ -e "$shimdir/tmux" ]; then
+	echo "FAIL: reserved tmux shimmed from a commands block"
+	exit 1
+fi
+echo "ok: commands block replaces the manifest"
+
+echo "== a declared command the image cannot resolve is reported, and still shimmed"
+case "$rebuild_out" in
+*"declared but not in the image"*definitely-absent*) ;;
+*)
+	echo "FAIL: no warning for a declared-but-absent command:"
+	echo "$rebuild_out"
+	exit 1
+	;;
+esac
+# Still shimmed on purpose: skipping it would silently hand the command to
+# the host, which is the failure declaring it was meant to prevent.
+if [ ! -x "$shimdir/definitely-absent" ]; then
+	echo "FAIL: a missing tool lost its shim, so the host's copy would run"
+	exit 1
+fi
+echo "ok: missing tool warned about and still shimmed"
+
+echo "== the container HOME is discoverable"
+# stdout must be the path alone, or `ls "$(coop tools home)"` stops
+# composing — the whole reason this command exists.
+home_out=$("$coop" tools home "$repo" 2>/dev/null)
+if [ "$home_out" != "$HOME/.local/state/coop/toolbox/$slug/home" ]; then
+	echo "FAIL: coop tools home printed $home_out"
+	exit 1
+fi
+# Written on container start, and visible rather than a dotfile: it has to
+# be seen by the ls of someone who got here by following a path.
+marker="$home_out/README.coop-toolbox"
+if [ ! -f "$marker" ]; then
+	echo "FAIL: no marker in the container home"
+	ls -la "$home_out" || true
+	exit 1
+fi
+case "$(cat "$marker")" in
+*"$repo"*) ;;
+*)
+	echo "FAIL: marker does not name the repo that owns it"
+	cat "$marker"
+	exit 1
+	;;
+esac
+echo "ok: home discoverable and marked"
 
 echo "== the reaper is PID 1"
 # Checked from inside the container's own PID namespace (docker exec

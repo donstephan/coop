@@ -17,6 +17,7 @@ import (
 
 	"coop/internal/config"
 	"coop/internal/hub"
+	"coop/internal/skills"
 	"coop/internal/tui"
 )
 
@@ -98,7 +99,7 @@ func tmuxDefaults() [][]string {
 // overrides (config.json "tmux", split into words — last wins) are
 // chained before new-session so the hub pane itself is born under them;
 // -f /dev/null keeps the user's personal tmux.conf off this socket.
-func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks bool, overrides [][]string, name string) []string {
+func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks, plugin bool, overrides [][]string, name string) []string {
 	argv := []string{"tmux", "-L", socket, "-f", os.DevNull, "start-server"}
 	for _, c := range tmuxDefaults() {
 		argv = append(append(argv, ";"), c...)
@@ -110,6 +111,7 @@ func createArgv(self, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks bo
 		self, "-socket", socket, "-allowed-cmds", cmds,
 		"-config", cfgPath, "-claude-cmd", claudeCmd, "-done-ttl", doneTTL,
 		"-hooks="+strconv.FormatBool(hooks),
+		"-plugin="+strconv.FormatBool(plugin),
 		";", "set-option", "-t", name+":", hub.HubMarker, "1")
 }
 
@@ -144,7 +146,7 @@ func nextHubName(sessions []hub.SessionInfo) string {
 // launchIntoTmux puts this terminal into a hub session and never
 // returns on success: reattach a detached hub if one exists, else
 // create a fresh one (retrying past name races) and attach to it.
-func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks bool, overrides [][]string) error {
+func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL string, hooks, plugin bool, overrides [][]string) error {
 	tmuxBin, err := exec.LookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux not found in PATH: %w", err)
@@ -164,7 +166,7 @@ func launchIntoTmux(tm *hub.ExecTmux, socket, cmds, cfgPath, claudeCmd, doneTTL 
 		for tries := 0; ; tries++ {
 			name = nextHubName(sessions)
 			argv := createArgv(self, socket, cmds, cfgPath, claudeCmd,
-				doneTTL, hooks, overrides, name)
+				doneTTL, hooks, plugin, overrides, name)
 			out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
 			if err == nil {
 				break
@@ -185,7 +187,7 @@ func main() {
 	// The hook subcommand is Claude Code calling home on every event;
 	// it must stay silent and fast, so it bypasses everything.
 	if isHookCmd(os.Args[1:]) {
-		os.Exit(runHookCLI(os.Stdin, os.Getenv))
+		os.Exit(runHookCLI(os.Stdin, os.Stdout, os.Getenv))
 	}
 
 	// coop peek: a human debug aid, and the same pre-flag dispatch for
@@ -219,6 +221,14 @@ func main() {
 	hooksEnv := envOr("COOP_HOOKS", "1")
 	hooks := flag.Bool("hooks", hooksEnv != "0" && hooksEnv != "false",
 		"inject status-publishing hooks into sessions created from the picker (COOP_HOOKS=0 or false disables)")
+	// Separate from -hooks on purpose: both flags happen to require a
+	// real claude that accepts flags, but they inject different things
+	// for different reasons, and one switch named after the other would
+	// mean the e2e's fake claude turns off the arbiter's status tier to
+	// say something about a skill.
+	pluginEnv := envOr("COOP_PLUGIN", "1")
+	plugin := flag.Bool("plugin", pluginEnv != "0" && pluginEnv != "false",
+		"inject the coop plugin (the /coop:init skill) into sessions created from the picker (COOP_PLUGIN=0 or false disables)")
 	flag.Parse()
 
 	ttl, err := time.ParseDuration(*doneTTL)
@@ -236,7 +246,7 @@ func main() {
 		}
 		// launchIntoTmux ends in exec on success — reaching here is failure.
 		err = launchIntoTmux(tm, *socket, *cmds, *configPath, *claudeCmd,
-			*doneTTL, *hooks, overrides)
+			*doneTTL, *hooks, *plugin, overrides)
 		fmt.Fprintln(os.Stderr, "coop:", err)
 		os.Exit(1)
 	}
@@ -256,18 +266,43 @@ func main() {
 	if err := hub.ApplyHubStyle(tm, hubSession, os.Getenv("TMUX_PANE")); err != nil {
 		fmt.Fprintln(os.Stderr, "coop: style:", err)
 	}
-	// Inject the status-publishing hooks into every session this hub
-	// launches. Best-effort: a failed write just means new sessions run
-	// on the title fallback, same as sessions from before the upgrade.
-	launchCmd := *claudeCmd
-	if *hooks {
+	// The pieces of a session's command are resolved here; the command
+	// itself is assembled per session, in sessionCmd below. It has to be:
+	// the --settings file is per-repo because it carries that repo's
+	// Bash(<tool> *) grants, and skills.WithPlugin's --add-dir is variadic
+	// and must stay last, so nothing can be appended after it later.
+	//
+	// exe names the running binary for both the hooks it registers and the
+	// shims it writes. Without it there is no hook settings file to write.
+	exe, exeErr := os.Executable()
+	if exeErr != nil {
+		fmt.Fprintln(os.Stderr, "coop: own path:", exeErr)
+	}
+	// The fallback settings file: coop hook on every event and no grants,
+	// for a session whose repo has no toolbox to derive them from. Written
+	// once here, as before. Best-effort — a failed write just means new
+	// sessions run on the title fallback, same as before the upgrade.
+	globalSettings := ""
+	if *hooks && exeErr == nil {
 		if p := hub.DefaultHookSettingsPath(); p != "" {
-			if exe, err := os.Executable(); err == nil {
-				if werr := hub.WriteHookSettings(p, exe); werr == nil {
-					launchCmd = hub.WithHookSettings(*claudeCmd, p)
-				} else {
-					fmt.Fprintln(os.Stderr, "coop: hook settings:", werr)
-				}
+			if werr := hub.WriteHookSettings(p, exe); werr == nil {
+				globalSettings = p
+			} else {
+				fmt.Fprintln(os.Stderr, "coop: hook settings:", werr)
+			}
+		}
+	}
+	// The coop plugin, carrying the /coop:init skill. Best-effort for the
+	// same reason: a failed write costs new sessions one skill, and claude
+	// starts normally on a --plugin-dir that isn't there, so a half-done
+	// state can't wedge a launch.
+	pluginDir := ""
+	if *plugin {
+		if d := skills.DefaultPluginDir(); d != "" {
+			if werr := skills.WritePlugin(d); werr == nil {
+				pluginDir = d
+			} else {
+				fmt.Fprintln(os.Stderr, "coop: plugin:", werr)
 			}
 		}
 	}
@@ -292,14 +327,22 @@ func main() {
 	// background. A PATH entry naming a briefly empty directory is
 	// harmless — a command in that window finds the host's tool, as it
 	// would today.
-	toolboxCmd := func(dir, cmd string) string { return cmd }
+	var toolboxCmd func(dir, cmd string) string
 	if tc, err := newToolboxCmd(*configPath); err != nil {
 		fmt.Fprintln(os.Stderr, "coop: toolbox:", err)
 	} else if tc != nil {
 		toolboxCmd = tc
 	}
+	launch := launcher{
+		hooks:          *hooks && exeErr == nil,
+		exe:            exe,
+		globalSettings: globalSettings,
+		pluginDir:      pluginDir,
+		toolboxCmd:     toolboxCmd,
+		settingsFor:    sessionSettingsPath,
+	}
 	m := tui.New(tm, splitCmds(*cmds), hubSession, *socket,
-		os.Getenv("TMUX_PANE"), launchCmd, toolboxCmd, loadRepos, addRepo, ttl)
+		os.Getenv("TMUX_PANE"), *claudeCmd, launch.command, loadRepos, addRepo, ttl)
 	final, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithReportFocus(),
 		tea.WithMouseCellMotion()).Run()
 	if fm, ok := final.(tui.Model); ok {

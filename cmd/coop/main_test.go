@@ -21,7 +21,7 @@ func indexOfSubslice(haystack, needle []string) int {
 
 func TestCreateArgvChainsDefaults(t *testing.T) {
 	got := createArgv("/bin/self", "cc", "claude,node", "/cfg.json", "claude",
-		"5m", true, nil, "roost-2")
+		"5m", true, true, nil, "roost-2")
 
 	// -f /dev/null keeps the user's personal tmux.conf off the hub server.
 	prefix := []string{"tmux", "-L", "cc", "-f", os.DevNull, "start-server"}
@@ -33,6 +33,7 @@ func TestCreateArgvChainsDefaults(t *testing.T) {
 		"/bin/self", "-socket", "cc", "-allowed-cmds", "claude,node",
 		"-config", "/cfg.json", "-claude-cmd", "claude", "-done-ttl", "5m",
 		"-hooks=true",
+		"-plugin=true",
 		";", "set-option", "-t", "roost-2:", "@coop", "1"}
 	if i := indexOfSubslice(got, suffix); i == -1 || i+len(suffix) != len(got) {
 		t.Fatalf("argv = %v, want suffix %v", got, suffix)
@@ -50,9 +51,32 @@ func TestCreateArgvChainsDefaults(t *testing.T) {
 	}
 }
 
+// -hooks and -plugin inject different things and must reach the child
+// hub independently — a bootstrap that collapsed them would silently
+// turn the status tier off to say something about a skill.
+func TestCreateArgvPropagatesHooksAndPluginIndependently(t *testing.T) {
+	tests := []struct {
+		hooks, plugin bool
+		want          []string
+	}{
+		{true, true, []string{"-hooks=true", "-plugin=true"}},
+		{true, false, []string{"-hooks=true", "-plugin=false"}},
+		{false, true, []string{"-hooks=false", "-plugin=true"}},
+		{false, false, []string{"-hooks=false", "-plugin=false"}},
+	}
+	for _, tt := range tests {
+		got := createArgv("/bin/self", "cc", "claude,node", "/cfg.json", "claude",
+			"5m", tt.hooks, tt.plugin, nil, "roost")
+		if indexOfSubslice(got, tt.want) == -1 {
+			t.Errorf("hooks=%v plugin=%v: argv = %v, want %v",
+				tt.hooks, tt.plugin, got, tt.want)
+		}
+	}
+}
+
 func TestCreateArgvAppendsOverridesLast(t *testing.T) {
 	got := createArgv("/bin/self", "cc", "claude,node", "/cfg.json", "claude",
-		"5m", false, [][]string{{"set", "-g", "mouse", "off"}}, "roost")
+		"5m", false, false, [][]string{{"set", "-g", "mouse", "off"}}, "roost")
 
 	// Overrides come after every default (so they win), right before
 	// new-session.
