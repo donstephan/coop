@@ -353,9 +353,19 @@ ENV PATH=/usr/local/go/bin:$PATH CGO_ENABLED=0
 RUN printf '%s\n' go gofmt >> /etc/coop/tools
 ```
 
-Its `.coop/toolbox.json` is one line — `{ "mounts": ["~/.local/bin:rw"] }` —
-because `go build -o ~/.local/bin/coop` has to land somewhere you can run it
-from.
+Its `.coop/toolbox.json` declares the three commands and the one mount that
+`go build -o ~/.local/bin/coop` needs to land somewhere you can run it from:
+
+```json
+{
+  "mounts": ["~/.local/bin:rw"],
+  "commands": {
+    "go":    { "allow": ["build", "test", "vet", "mod"] },
+    "gofmt": { "allow": true },
+    "jq":    {}
+  }
+}
+```
 
 `CGO_ENABLED=0` matters whenever a repo builds something that runs on the host:
 it makes the binary static, so a debian-slim build runs on your Ubuntu without

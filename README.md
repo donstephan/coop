@@ -26,6 +26,13 @@ screen where:
 - you can answer a numbered dialog (`❯ 1. Yes`) without leaving the
   dashboard — just press the digit
 
+Two things run alongside that: the **[arbiter](#arbiter)**, which reads
+a session's dialog and leaves you a one-line "here's what this is
+asking, and here's the answer I'd give", and the
+**[toolbox](#toolbox)**, which gives each repo its command-line tooling
+out of a container so sessions stop reaching for — and installing
+things on — your host.
+
 ## Quick start
 
 1. Build and run (needs Go and tmux ≥ 3.2):
@@ -185,21 +192,207 @@ arbiter is handed.
 
 ## Toolbox
 
-A repo can declare the command-line tooling its sessions need — a python
-with the right libraries, `mongosh`, a pinned `terraform` — in a
-`.coop/tools.Dockerfile` beside its code, and coop puts that tooling on
-the session's `PATH` through transparent shims backed by one container
-per repo. The repo is mounted at its own host path, so a traceback, a
-config file's absolute path and anything claude then opens with `Read`
-all name the same file; the container starts on the first command that
-uses it and exits itself when it has been idle. With no config at all a
-session gets `python3`, `pip3`, `jq` and `curl` from the base image
-(`git`, `gh` and `make` ship in it but are deliberately not shimmed);
-with no docker installed nothing changes at all. It is a
-reproducible toolchain and a clean host, **not** a sandbox — the repo is
-mounted read-write and the container runs as you. Running `/coop:init` in a
-session sets a repo up: it reads the toolchain, asks all-in or tools-only, and
-writes the overlay. See [docs/toolbox.md](docs/toolbox.md).
+Sessions run commands. Left to itself, a Claude Code session runs them
+against whatever happens to be on your host — the Go you installed two
+years ago, a `python3` missing the library the repo needs, a
+`terraform` a minor version off. And when something *is* missing, the
+obliging thing for a session to do is install it, on your machine,
+where it stays.
+
+The toolbox moves that side of the work into a container the repo
+declares for itself. **One container per repo**, holding that repo's
+tooling; the session calls those tools by their plain names and never
+knows the difference.
+
+### What it looks like from inside a session
+
+Nothing. That's the design. Claude types
+
+```
+go build ./cmd/coop
+```
+
+and that is the exact string that runs, the exact string the permission
+prompt shows you, and the exact string in the transcript. What's
+different is that `go` was found in a directory coop put first on the
+session's `PATH`, holding a small script — a *shim* — that hands the
+command to the repo's container.
+
+The repo is mounted in that container **at its own host path**, not at
+some `/workspace`, and the container runs as your uid. So a path is a
+path: a stack trace, an absolute path in a config file, and the file
+claude then opens with `Read` all name the same thing, and files the
+container writes belong to you.
+
+### What happens, in order
+
+1. **You start a session** (`n` in the TUI). coop works out which image
+   this repo resolves to, reads the list of commands it should shim,
+   writes one shim per command into a per-repo directory, and puts that
+   directory first on the session's `PATH`. No container starts yet.
+2. **The session runs a shimmed command.** *Now* a container starts —
+   named `coop-tools-<repo>-<hash>`, so it's recognisable in
+   `docker ps`. It's reused by every session on that repo.
+3. **The container reaps itself.** It watches for work and exits once
+   it's been idle (30 minutes by default), taking itself out of
+   `docker ps` and out of your RAM. There is no daemon doing this and
+   no state file tracking it — the container is its own PID 1.
+4. **The next command brings it back**, about a second's hiccup on one
+   command. Same path for a container you killed by hand, or a session
+   older than the toolbox itself. You will never type a command to
+   start or stop one.
+
+### Zero config
+
+Install docker, start a session, and you get `python3`, `pip3`, `jq`
+and `curl` from a base image coop builds on your machine on first use
+(nothing is pulled from a coop registry; there isn't one). `git`, `gh`
+and `make` are *in* the image but deliberately not shimmed — a
+container `gh` has none of your auth, and `make` would drive a build in
+an image that ships no compilers.
+
+The very first session on a machine has to build that base image, which
+takes a few minutes and happens in the background while you're already
+working — commands in that window still find the host's tools, and the
+shims appear when the build finishes. If it fails, the reason is in
+`~/.local/state/coop/toolbox/build.log` and the session carries on with
+the host.
+
+**With no docker installed, nothing about coop changes.** No shims are
+written, `PATH` is untouched, and every command runs the way it did
+before.
+
+### Declaring a repo's own tooling
+
+Two files, both in `.coop/` beside the code:
+
+```dockerfile
+# .coop/tools.Dockerfile — what's installed
+FROM coop-tools:base
+RUN pip install --no-cache-dir pymongo boto3
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+```json
+// .coop/toolbox.json — what's on PATH, and what stops prompting
+{
+  "commands": {
+    "python3": { "allow": true },
+    "psql":    {},
+    "jq":      {}
+  }
+}
+```
+
+Installing a tool and shimming a tool are separate steps on purpose:
+`pip install pymongo` makes it importable from a `python3` you already
+declared, and you only add a `commands` entry for a new command a
+session runs *by name*. The `commands` block is the **complete** list
+for the repo — it replaces the image's own list rather than adding to
+it, so one file tells you everything this repo shims. Leave it out and
+you get the image's list, which is the zero-config path above.
+
+The quick way to write both is to run **`/coop:init`** in any session
+coop launched. It reads the repo's manifests, CI config and compose
+file, asks you one question — all-in or tools-only — and writes the two
+files, leaving `coop tools rebuild .` for you to run where you can see
+the build output.
+
+### Permissions: how the prompts stop
+
+Because a shim doesn't change the command string, the way to stop being
+prompted for a containerized tool is to allow the **bare name**. You
+don't write that rule anywhere — mark the command and coop writes it:
+
+```json
+{ "commands": { "go": { "allow": ["build", "test", "vet"] },
+                "gofmt": { "allow": true } } }
+```
+
+That becomes `Bash(go build *)`, `Bash(go test *)`, `Bash(go vet *)`,
+`Bash(gofmt *)` in a settings file coop writes under its own state
+directory and hands to the session with `--settings`. `allow` is
+default-deny: anything declared without it is still shimmed and still
+prompts.
+
+**Nothing is written into your repo, and that's the point.** A rule in
+a committed `.claude/settings.json` also reaches a `claude` somebody
+starts outside coop — where there is no shim, and `Bash(go *)` now
+means "run the host's Go, unattended, no prompt". The grant was made on
+the assumption "bare name = container"; committing it carries the grant
+somewhere the assumption doesn't hold. An injected file reaches exactly
+the sessions coop launched, which are exactly the sessions that have
+the shims.
+
+coop goes one further and derives the rules from the shims that
+actually **exist on disk**, not from what the file declares — so a
+first session on a fresh clone, launched while the image is still
+building, gets no grants rather than grants with the host's tools
+behind them. A grant can't arrive before the tool it grants.
+
+Both shims and grants are resolved when a session is created, so
+**edits apply to your next session**, not the one you're in.
+`coop tools grants` prints what a new session would get, and says why
+anything you marked `allow` is missing.
+
+### Things that will surprise you once
+
+- **`$HOME` in the container is not your home.** It's a coop-owned
+  per-repo directory, so `go install`, `pip install --user`, `npm i -g`
+  and `cargo install` all succeed and then can't be found from the
+  host. `coop tools home` prints where they went, and a
+  `README.coop-toolbox` sits in that directory explaining it. To make
+  an install land on the host, mount the target: `{"mounts":
+  ["~/.local/bin:rw"]}`.
+- **All-in or all-out, per repo.** If the repo's compiler is in the
+  container, its builds and tests belong there too. A split toolchain —
+  `go test` inside, `go build` outside — is how you get a binary
+  written somewhere you'll never look. (coop itself is all-in; see its
+  `.coop/tools.Dockerfile`.)
+- **Your shell's environment doesn't come along.** The container gets
+  `TERM`, `LANG`, `LC_*` and `TZ` and nothing else. A variable a tool
+  needs belongs in the overlay's `ENV`, where it travels with the repo.
+- **The build context is `.coop/`, not the repo**, so `COPY` can only
+  reach files next to the Dockerfile.
+- **`tmux`, `docker`, `podman` and `coop` are never shimmed**, whatever
+  a config says. coop runs those by bare name from inside monitored
+  sessions, and a shim wouldn't fail loudly — it would quietly reroute
+  coop's own plumbing.
+
+Sessions coop launches are told the first two of these directly: on
+every `SessionStart` — including after a compaction, 200k tokens in —
+coop injects a short note listing the containerized commands and naming
+the container `$HOME`. Nothing is written to your repo to make that
+happen, and no session started outside coop sees it, since there the
+note would be false.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `coop tools ls` | Running toolbox containers |
+| `coop tools up [repo]` | Start one now instead of on first use |
+| `coop tools shell [repo]` | Interactive shell inside it |
+| `coop tools stop [repo]` | Kill it (the next command restarts it) |
+| `coop tools rebuild [repo]` | Rebuild the image with build output on your terminal |
+| `coop tools prune` | Remove stopped containers and superseded images |
+| `coop tools home [repo]` | Print the container's `$HOME` for that repo |
+| `coop tools grants [repo]` | Print the permission rules a new session would get |
+
+`[repo]` defaults to the working directory.
+
+### Not a sandbox
+
+The repo is mounted read-write, the container runs as your uid, `/tmp`
+is shared, and a container joined to a compose network reaches whatever
+that network reaches. Anything with code execution inside can rewrite
+the repo. The docker socket is never mounted — that's the one line that
+would make this much worse — but what you get is a **reproducible
+toolchain and a clean host**, not isolation.
+
+The full guide, including networks, extra mounts, going all-in and the
+failure modes, is [docs/toolbox.md](docs/toolbox.md).
 
 ## Config
 
@@ -213,6 +406,9 @@ writes the overlay. See [docs/toolbox.md](docs/toolbox.md).
 | `-allowed-cmds` | `COOP_ALLOWED_CMDS` | `claude,node` | commands quick-send may target (`""` = never send) |
 | `-done-ttl` | `COOP_DONE_TTL` | `5m` | how long a finished session shows `done` before decaying to idle (`0` disables) |
 | `arbiter.model` (config.json) | — | `sonnet` | model each triage episode runs (`claude -p --model <model>`) |
+| `toolbox.enabled` (config.json) | — | on | `false` stops new sessions getting shims |
+| `toolbox.engine` (config.json) | — | `docker` | container engine (`podman` works) |
+| `toolbox.idle_timeout` (config.json) | — | `30m` | how long a toolbox container sits idle before exiting itself (`"0"` = never) |
 
 `~/.config/coop/config.json` holds the repo list for the `n` picker and,
 optionally, tmux overrides (see below). The picker's `+ add new repo` row
@@ -222,7 +418,8 @@ appends to `repos`; anything else in the file is left as you wrote it:
 {
   "repos": ["~/proj/foo"],
   "tmux": ["set -g history-limit 100000", "set -g mouse off"],
-  "arbiter": {"model": "sonnet"}
+  "arbiter": {"model": "sonnet"},
+  "toolbox": {"enabled": true, "engine": "docker", "idle_timeout": "30m"}
 }
 ```
 
@@ -264,6 +461,10 @@ To override or extend any of it, add entries to the `tmux` list in
   view — but a full server restart forgets it.
 - The list groups sessions by repo, alphabetically, and never reorders on
   status — rows stay where you left them.
+- The toolbox has no state store either: `docker ps` is the query, and a
+  container decides for itself when to exit. coop persists nothing about
+  containers — no file, no refcount — so nothing has to be kept in sync
+  and nothing is left behind when the TUI quits.
 
 ## Tests
 
