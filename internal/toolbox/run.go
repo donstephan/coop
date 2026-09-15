@@ -66,6 +66,10 @@ func RunArgs(repo, image string, cfg RepoConfig, idle time.Duration) ([]string, 
 	if err != nil {
 		return nil, err
 	}
+	// A declared path this host does not have is not a mount. The
+	// engine would create it as root and mount it empty; the human-
+	// facing "coop tools" subcommands report what was skipped.
+	mounts, _ = SplitMounts(mounts)
 	args := []string{"run", "-d", "--rm",
 		"--name", ContainerName(repo),
 		"--label", "coop.managed=true",

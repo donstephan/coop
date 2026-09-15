@@ -1,6 +1,7 @@
 package toolbox
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,6 +94,11 @@ func TestInspect(t *testing.T) {
 
 func TestRunArgsNetworkAndMounts(t *testing.T) {
 	home := fakeHome(t)
+	// The directory has to be there: a declared path this host does not
+	// have is skipped rather than mounted.
+	if err := os.MkdirAll(filepath.Join(home, ".local", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cfg := RepoConfig{Network: "sprocket-v2_default", Mounts: []string{"~/.local/bin:rw"}}
 	args, err := RunArgs("/home/user/sprocket-v2", "img", cfg, time.Minute)
 	if err != nil {
@@ -163,5 +169,23 @@ func TestResolveCwd(t *testing.T) {
 	}
 	if got := ResolveCwd(repo, "/home/user/elsewhere", mounts); got != repo {
 		t.Errorf("unmounted cwd = %q, want the repo root", got)
+	}
+}
+
+func TestRunArgsSkipsMountsMissingOnThisHost(t *testing.T) {
+	fakeHome(t)
+	present := t.TempDir()
+	absent := filepath.Join(t.TempDir(), "another-users-layout")
+	cfg := RepoConfig{Mounts: []string{present + ":ro", absent + ":ro"}}
+	args, err := RunArgs("/home/user/sprocket-v2", "img", cfg, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := argLine(args)
+	if !strings.Contains(line, "-v "+present+":"+present+":ro") {
+		t.Errorf("a mount this host does have was dropped: %s", line)
+	}
+	if strings.Contains(line, absent) {
+		t.Errorf("docker would create %s as root and mount it empty: %s", absent, line)
 	}
 }

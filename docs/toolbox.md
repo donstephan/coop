@@ -332,6 +332,24 @@ Find the name with `docker network ls`; for compose it's usually
   the sharper one: `~/.local/state/coop/toolbox/<slug>/bin` holds another repo's
   shims, which are `#!/bin/sh` scripts that run on the host the moment that
   repo's session calls `python3`.
+- **A path that doesn't exist on this host is skipped, not mounted.** docker
+  doesn't fail on an absent bind source — it creates the path as root and
+  mounts it empty, leaving a directory only `sudo` can remove and a tool that
+  reads nothing out of it. So a mount whose source isn't there is dropped, and
+  `coop tools up|shell|rebuild` prints one line naming what it skipped. The
+  shims stay quiet about it.
+
+That last rule is what lets one committed `toolbox.json` serve **two people
+whose checkouts live in different places**: list both paths, and each host
+mounts the one it has.
+
+```json
+{ "mounts": ["~/Documents/work/sprocket-data:ro", "~/src/sprocket-data:ro"] }
+```
+
+Mounts land at their host path, so the directory is at a *different* absolute
+path for each of you — whatever reads it has to find it relatively (`../sprocket-data`
+from the repo) rather than by hardcoded absolute path.
 
 Mount `~/.local/bin:rw` if the repo builds something you install there —
 otherwise the build succeeds and the binary vanishes (see *Gotchas*).

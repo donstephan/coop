@@ -239,3 +239,36 @@ func TestAllowRejectsWrongType(t *testing.T) {
 		t.Fatal("want an error for a string allow value")
 	}
 }
+
+// docker does not fail on a bind source that is absent: it creates the
+// path on the host as root and mounts it empty. A repo naming a path
+// only some checkouts have would get a silently-empty directory and host
+// junk only sudo can remove, so an absent source is not a mount.
+func TestSplitMountsSeparatesWhatThisHostHas(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "config")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "never")
+	dangling := filepath.Join(dir, "link")
+	if err := os.Symlink(absent, dangling); err != nil {
+		t.Fatal(err)
+	}
+
+	present, missing := SplitMounts([]Mount{
+		{Path: dir, RW: true}, {Path: absent}, {Path: file}, {Path: dangling},
+	})
+
+	if len(present) != 2 || present[0].Path != dir || present[1].Path != file {
+		t.Errorf("present = %+v, want the directory and the file", present)
+	}
+	if !present[0].RW {
+		t.Error("a kept mount must come back unaltered")
+	}
+	// A dangling symlink resolves to nothing, which is what docker would
+	// act on, so it belongs with the absent path rather than the present.
+	if len(missing) != 2 || missing[0].Path != absent || missing[1].Path != dangling {
+		t.Errorf("missing = %+v, want the absent path and the dangling symlink", missing)
+	}
+}

@@ -166,6 +166,31 @@ func (m Mount) Arg() string {
 	return m.Path + ":" + m.Path + ":" + mode
 }
 
+// SplitMounts partitions resolved mounts by whether this host has the
+// source path. docker does not fail on a bind source that is absent: it
+// creates the path as root and mounts it empty, so a repo naming a path
+// only some checkouts have — a sibling repo, a shared directory two
+// users keep in different places — would get a silently-empty directory
+// and host junk only sudo can remove. Start already acts on this one
+// line up, creating the container's HOME for the same reason.
+//
+// Only ErrNotExist counts as absent. Any other stat error is "cannot
+// tell", where dropping the mount would hide a permissions problem
+// behind a directory that is simply not there; those go to the engine,
+// which says so.
+func SplitMounts(mounts []Mount) (present, missing []Mount) {
+	for _, m := range mounts {
+		// Stat, not Lstat: a dangling symlink resolves to nothing, which
+		// is what docker would act on.
+		if _, err := os.Stat(m.Path); errors.Is(err, fs.ErrNotExist) {
+			missing = append(missing, m)
+			continue
+		}
+		present = append(present, m)
+	}
+	return present, missing
+}
+
 // RepoConfigPath is <repo>/.coop/toolbox.json.
 func RepoConfigPath(repo string) string {
 	return filepath.Join(repo, ".coop", "toolbox.json")

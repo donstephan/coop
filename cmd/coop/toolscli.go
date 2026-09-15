@@ -143,6 +143,10 @@ func toolsExec(repo, tool string, rest []string) int {
 		return 1
 	}
 	mounts, _ := toolbox.ParseMounts(cfg.Mounts) // validated by ensureContainer
+	// Only the mounts the container actually has, so a cwd under a
+	// skipped one falls back to the repo root instead of becoming a -w
+	// the container cannot see.
+	mounts, _ = toolbox.SplitMounts(mounts)
 	cwd, _ := os.Getwd()
 	args := toolbox.ExecArgs(repo, toolbox.ResolveCwd(repo, cwd, mounts), tool, rest, false)
 	if !started {
@@ -295,6 +299,18 @@ func toolsManage(sub, repo string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "coop tools:", err)
 		return 1
+	}
+	// Said here and not from the shims: coop tools exec has to stay quiet
+	// or every idle-out would put this line in a session's output, and
+	// these three are where a human is watching. Left out of ls, which
+	// takes no repo and answers "what is running", not "what does this
+	// repo declare".
+	if sub == "up" || sub == "shell" || sub == "rebuild" {
+		if mounts, err := toolbox.ParseMounts(cfg.Mounts); err == nil {
+			if _, missing := toolbox.SplitMounts(mounts); len(missing) > 0 {
+				fmt.Fprintln(stderr, "warning:", skippedMountsWarning(missing))
+			}
+		}
 	}
 	switch sub {
 	case "stop":
@@ -527,6 +543,20 @@ func missingToolsWarning(missing []string) error {
 	return fmt.Errorf("declared but not in the image: %s — their shims will fail at exec; "+
 		"install them in .coop/tools.Dockerfile or drop them from \"commands\" in .coop/toolbox.json",
 		strings.Join(missing, ", "))
+}
+
+// skippedMountsWarning phrases an absent mount as the two things it can
+// mean, since a bare path reads as a coop failure rather than as a repo
+// declaring a path this host does not have.
+func skippedMountsWarning(missing []toolbox.Mount) error {
+	paths := make([]string, len(missing))
+	for i, m := range missing {
+		paths[i] = m.Path
+	}
+	return fmt.Errorf("declared but not present on this host: %s — skipped, since the engine "+
+		"would create them as root and mount them empty; fix the path in .coop/toolbox.json, "+
+		"or ignore this if the entry is for another checkout's layout",
+		strings.Join(paths, ", "))
 }
 
 func toolsList(stdout, stderr io.Writer) int {

@@ -253,3 +253,18 @@ func TestHomeMarkerIsVisible(t *testing.T) {
 		t.Errorf("marker %q is a dotfile", toolbox.HomeMarkerName)
 	}
 }
+
+// Phrased as the edits that resolve it, like missingToolsWarning: a bare
+// path reads as a coop failure rather than as a repo declaring a path
+// this host does not have.
+func TestSkippedMountsWarning(t *testing.T) {
+	msg := skippedMountsWarning([]toolbox.Mount{
+		{Path: "/home/user/workspace/sprocket-v2"},
+		{Path: "/srv/data"},
+	}).Error()
+	for _, want := range []string{"/home/user/workspace/sprocket-v2", "/srv/data", ".coop/toolbox.json"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("warning = %q, want it to name %q", msg, want)
+		}
+	}
+}
