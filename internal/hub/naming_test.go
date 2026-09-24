@@ -24,3 +24,16 @@ func TestNextSessionName(t *testing.T) {
 		})
 	}
 }
+
+// The session id is read back from a pane option any process on the
+// socket can write, so it reaches the shell quoted, never bare.
+func TestForkCommand(t *testing.T) {
+	got := ForkCommand("claude", "0b6e-4f2a")
+	if want := "claude --resume '0b6e-4f2a' --fork-session"; got != want {
+		t.Errorf("ForkCommand = %q, want %q", got, want)
+	}
+	got = ForkCommand("claude", "x'; rm -rf ~; '")
+	if want := `claude --resume 'x'\''; rm -rf ~; '\''' --fork-session`; got != want {
+		t.Errorf("ForkCommand = %q, want %q", got, want)
+	}
+}

@@ -931,6 +931,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.picking = true
 		m.adding, m.repoPath = false, ""
 		m.repos, m.repoFilter, m.repoIdx = repos, "", 0
+	case "d":
+		i := m.indexOf(m.selectedID)
+		if i < 0 {
+			return m, nil
+		}
+		p := m.panes[i]
+		if p.Claude == nil || p.Claude.SessionID == "" {
+			m.actionErr = "no session id to duplicate (hooks off?)"
+			return m, nil
+		}
+		// session_path, not the hook's cwd: resume finds the transcript
+		// by the directory claude was launched in, and the toolbox keys
+		// on the repo — both are where coop started the session.
+		name := hub.NextSessionName(m.sessionNames(), p.Path)
+		m.pendingSession = name
+		return m, m.newSessionCmd(name, p.Path,
+			hub.ForkCommand(m.claudeCmd, p.Claude.SessionID))
 	case "x":
 		if i := m.indexOf(m.selectedID); i >= 0 {
 			m.confirmKill = m.panes[i].Session
@@ -1093,7 +1110,13 @@ func (m Model) sessionNames() []string {
 // session has no client to size it and would default to 80x24, showing
 // tiny in the preview. Best-effort: 0,0 falls back to tmux's default.
 func (m Model) createCmd(name, dir string) tea.Cmd {
-	tm, cmd, live := m.tmux, m.claudeCmd, m.livePane
+	return m.newSessionCmd(name, dir, m.claudeCmd)
+}
+
+// newSessionCmd is createCmd with the base claude command supplied, for
+// a duplicate's resume flags.
+func (m Model) newSessionCmd(name, dir, cmd string) tea.Cmd {
+	tm, live := m.tmux, m.livePane
 	wrap := m.toolboxCmd
 	return func() tea.Msg {
 		w, h := 0, 0
@@ -1607,7 +1630,7 @@ func (m Model) viewFooter() string {
 	case m.showHelp:
 		hints = []string{"↑/↓ select", "enter focus", "tab next input",
 			"shift+←/→ switch pane", "0-9 answer", "space apply suggestion",
-			"bksp erase", "/ command", "n new", "x kill", "s stats", m.arbiterHint(),
+			"bksp erase", "/ command", "n new", "d duplicate", "x kill", "s stats", m.arbiterHint(),
 			"pgup/pgdn scroll msg", "q quit", "? close"}
 	default:
 		// Contextual chips, most actionable first — rows are scarce at

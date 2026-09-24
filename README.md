@@ -77,6 +77,7 @@ starts. You can also fill the list in by hand:
 | `Backspace` | pass backspace to the selected session (erase a stray digit) |
 | `/` | start a slash command in the selected session (types `/` there, then focuses the live view) |
 | `n` | create a new session (repo picker; its last row adds a repo to the config) |
+| `d` | duplicate the selected session: a new session resuming its conversation as a fork (`claude --resume <id> --fork-session`), so the two continue independently. Needs the hook-published session id. |
 | `a` | toggle the arbiter (off ↔ recommend) |
 | `s` | cycle the right-hand stat column: off → context → model |
 | `pgup`/`pgdn` | scroll the footer message box when a message overflows it |

@@ -2842,3 +2842,42 @@ func TestConfirmReplacesMsgBox(t *testing.T) {
 		t.Errorf("footer = %q, want no message box during a confirm", foot)
 	}
 }
+
+// d forks the selected session's conversation into a new session in the
+// same directory, and selects it once it appears, the way n does.
+func TestDuplicateForksSelectedSession(t *testing.T) {
+	panes := testPanes()
+	panes[1].Claude = &hub.ClaudeState{SessionID: "abc-123", Status: "idle"}
+	f := &fakeTmux{panes: panes}
+	m := pollOnce(t, f) // alpha selected
+
+	next, cmd := m.Update(keyRunes("d"))
+	m = drive(t, next.(Model), cmd)
+	want := [3]string{"alpha-repo", "/repos/alpha-repo",
+		"claude --resume 'abc-123' --fork-session"}
+	if len(f.created) != 1 || f.created[0] != want {
+		t.Fatalf("created = %v, want %v", f.created, want)
+	}
+	f.panes = append(f.panes, hub.Pane{Session: "alpha-repo", ID: "%7",
+		Title: "✳ Claude Code", Cmd: "claude"})
+	m = drive(t, m, m.poll())
+	if m.selectedID != "%7" {
+		t.Fatalf("selectedID = %q, want %%7 (duplicate auto-selected)", m.selectedID)
+	}
+}
+
+// With no published session id there is nothing to resume: refuse rather
+// than launch a fresh conversation that reads as a copy.
+func TestDuplicateWithoutSessionIDRefuses(t *testing.T) {
+	f := &fakeTmux{panes: testPanes()}
+	m := pollOnce(t, f) // alpha selected, no Claude state
+
+	next, cmd := m.Update(keyRunes("d"))
+	m = next.(Model)
+	if cmd != nil || len(f.created) != 0 {
+		t.Fatalf("created = %v, want nothing", f.created)
+	}
+	if !strings.Contains(m.actionErr, "no session id") {
+		t.Errorf("actionErr = %q, want a no-session-id message", m.actionErr)
+	}
+}

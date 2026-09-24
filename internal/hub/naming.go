@@ -23,3 +23,11 @@ func NextSessionName(existing []string, dir string) string {
 	}
 	return name
 }
+
+// ForkCommand is claudeCmd resuming sessionID as a new conversation:
+// --fork-session gives the copy its own id, so the two diverge without
+// writing into each other's transcript. The id is read back from a pane
+// option any process on the socket can set, so it is quoted.
+func ForkCommand(claudeCmd, sessionID string) string {
+	return claudeCmd + " --resume " + shellQuote(sessionID) + " --fork-session"
+}

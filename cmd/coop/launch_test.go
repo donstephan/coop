@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"coop/internal/hub"
 )
 
 // --add-dir is variadic, so anything appended after it is read as another
@@ -94,5 +96,24 @@ func TestLauncherHooksOffAppendsNoSettings(t *testing.T) {
 	}
 	if got := l.command("/home/user/sprocket-v2", "sleep 300"); strings.Contains(got, "--settings") {
 		t.Errorf("appended --settings with hooks off: %q", got)
+	}
+}
+
+// A duplicate's resume flags ride on the base command, so the launcher
+// must still put --add-dir after them.
+func TestLauncherKeepsAddDirLastForFork(t *testing.T) {
+	l := launcher{
+		hooks:          true,
+		exe:            "/home/user/bin/coop",
+		globalSettings: "/state/coop/hooks-settings.json",
+		pluginDir:      "/state/coop/plugin",
+	}
+	got := l.command("/home/user/sprocket-v2", hub.ForkCommand("claude", "abc"))
+	addDir := strings.Index(got, "--add-dir")
+	if addDir < 0 || strings.Index(got, "--fork-session") > addDir {
+		t.Fatalf("--fork-session must precede --add-dir: %q", got)
+	}
+	if rest := got[addDir+len("--add-dir"):]; strings.Contains(rest, " --") {
+		t.Errorf("a flag follows --add-dir: %q", got)
 	}
 }
